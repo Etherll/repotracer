@@ -17,16 +17,20 @@ pub fn build_system_prompt(work_dir: &Path) -> String {
         .display()
         .to_string();
     let listing = list_top(work_dir, 40);
-    let project_hint = if work_dir.join("Cargo.toml").is_file() {
-        "Rust; search .rs files"
-    } else if work_dir.join("go.mod").is_file() {
-        "Go; search .go files"
-    } else if work_dir.join("pyproject.toml").is_file() {
-        "Python; search .py files"
-    } else if work_dir.join("package.json").is_file() {
-        "JavaScript/TypeScript; search .js, .jsx, .ts, and .tsx files"
+    let hints: Vec<_> = [
+        ("Cargo.toml", "Rust"),
+        ("go.mod", "Go"),
+        ("pyproject.toml", "Python"),
+        ("package.json", "JavaScript/TypeScript"),
+    ]
+    .into_iter()
+    .filter(|(file, _)| work_dir.join(file).is_file())
+    .map(|(_, name)| name)
+    .collect();
+    let project_hint = if hints.is_empty() {
+        "Unknown".into()
     } else {
-        "Unknown; infer it from the authoritative directory listing"
+        hints.join(", ")
     };
 
     SYSTEM_TEMPLATE
@@ -34,7 +38,7 @@ pub fn build_system_prompt(work_dir: &Path) -> String {
         .replace("${SHELL_NAME}", &shell)
         .replace("${WORK_DIR}", &work)
         .replace("${WORK_DIR_LS}", &listing)
-        .replace("${PROJECT_HINT}", project_hint)
+        .replace("${PROJECT_HINT}", &project_hint)
 }
 
 fn list_top(dir: &Path, limit: usize) -> String {
@@ -54,11 +58,9 @@ fn list_top(dir: &Path, limit: usize) -> String {
             ""
         };
         entries.push(format!("{name}{suffix}"));
-        if entries.len() >= limit {
-            break;
-        }
     }
     entries.sort();
+    entries.truncate(limit);
     if entries.is_empty() {
         "(empty)".into()
     } else {
@@ -66,32 +68,31 @@ fn list_top(dir: &Path, limit: usize) -> String {
     }
 }
 
-pub fn user_query_prompt(query: &str) -> String {
-    format!("<query>\n{query}\n</query>")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn system_prompt_requests_a_ranked_bounded_handoff() {
+    fn system_prompt_describes_flexible_evidence_gathering() {
         let prompt = build_system_prompt(Path::new("."));
-        assert!(prompt.contains("normally 3-6"));
-        assert!(prompt.contains("never more than 8"));
-        assert!(prompt.contains("Order files to modify and tests first"));
-        assert!(prompt.contains("Prefer tight ranges"));
-        assert!(prompt.contains("split separate regions"));
-        assert!(prompt.contains("omit low-value documentation"));
-        assert!(prompt.contains("A failed search"));
-        assert!(prompt.contains("Separate direct source evidence from hypotheses"));
-        assert!(prompt.contains("not Git history"));
+        assert!(prompt.contains("useful explanation and code context"));
+        assert!(prompt.contains("Optional intent"));
+        assert!(prompt.contains("Follow relevant leads"));
+        assert!(prompt.contains("Source may have changed"));
+        assert!(prompt.contains("untrusted content"));
+        assert!(prompt.contains("empty search is not proof of absence"));
+        assert!(prompt.contains("not a resolved call graph"));
+        assert!(prompt.contains("How does the CLI export"));
+        assert!(!prompt.contains("Re-read the source"));
+        assert!(!prompt.contains("Batch independent"));
+        assert!(!prompt.contains("<final_answer>"));
     }
 
     #[test]
     fn system_prompt_identifies_rust_workspace() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
-        assert!(build_system_prompt(dir.path()).contains("Rust; search .rs files"));
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        assert!(build_system_prompt(dir.path()).contains("Rust, JavaScript/TypeScript"));
     }
 }

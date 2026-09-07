@@ -1,14 +1,134 @@
-use crate::citations::{parse_citations, validate_citations};
+use crate::assess_output;
 use crate::config::ExplorerBudget;
-use crate::prompt::{build_system_prompt, user_query_prompt};
-use crate::types::{ScoutRequest, ScoutResult, ScoutStats};
-use repotracer_model::{ChatMessage, ModelBackend, ModelRequest, ToolSpec};
+use crate::prompt::build_system_prompt;
+use crate::types::{ScoutRequest, ScoutResult, ScoutStats, UsageStats, UsageStatus};
+use repotracer_model::{ChatMessage, ModelBackend, ModelRequest, ToolSpec, Usage};
 use repotracer_repo_tools::{resolve_in_root, RepoTools, ToolCall};
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{debug, warn};
+
+/// Accumulates one reported usage object per model generation. OpenAI
+/// Chat Completions usage is per request, so unlike the app-server transport
+/// these values are additive across generations. `None` is sticky for a
+/// dimension: a missing field in any generation makes that aggregate field
+/// unknown instead of silently treating it as zero.
+#[derive(Clone, Default)]
+struct UsageAccumulator {
+    observed: bool,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_write_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    total_tokens: u64,
+    input_missing: bool,
+    cached_input_missing: bool,
+    cache_write_input_missing: bool,
+    output_missing: bool,
+    reasoning_output_missing: bool,
+    total_missing: bool,
+}
+
+impl UsageAccumulator {
+    fn add(&mut self, usage: &Usage) {
+        self.observed = true;
+        add_dimension(
+            usage.prompt_tokens,
+            &mut self.input_tokens,
+            &mut self.input_missing,
+        );
+        add_dimension(
+            usage.cached_prompt_tokens,
+            &mut self.cached_input_tokens,
+            &mut self.cached_input_missing,
+        );
+        add_dimension(
+            usage.cache_write_prompt_tokens,
+            &mut self.cache_write_input_tokens,
+            &mut self.cache_write_input_missing,
+        );
+        add_dimension(
+            usage.completion_tokens,
+            &mut self.output_tokens,
+            &mut self.output_missing,
+        );
+        add_dimension(
+            usage.reasoning_output_tokens,
+            &mut self.reasoning_output_tokens,
+            &mut self.reasoning_output_missing,
+        );
+        add_dimension(
+            usage.total_tokens,
+            &mut self.total_tokens,
+            &mut self.total_missing,
+        );
+    }
+
+    fn finish(&self) -> (UsageStats, UsageStatus) {
+        if !self.observed {
+            return (UsageStats::default(), UsageStatus::Unknown);
+        }
+        let usage = UsageStats {
+            input_tokens: known_total(self.input_tokens, self.input_missing),
+            cached_input_tokens: known_total(self.cached_input_tokens, self.cached_input_missing),
+            cache_write_input_tokens: known_total(
+                self.cache_write_input_tokens,
+                self.cache_write_input_missing,
+            ),
+            output_tokens: known_total(self.output_tokens, self.output_missing),
+            reasoning_output_tokens: known_total(
+                self.reasoning_output_tokens,
+                self.reasoning_output_missing,
+            ),
+            total_tokens: known_total(self.total_tokens, self.total_missing),
+        };
+        let complete = !self.input_missing
+            && !self.cached_input_missing
+            && !self.cache_write_input_missing
+            && !self.output_missing
+            && !self.reasoning_output_missing
+            && !self.total_missing;
+        (
+            usage,
+            if complete {
+                UsageStatus::Complete
+            } else {
+                UsageStatus::Partial
+            },
+        )
+    }
+}
+
+fn add_dimension(value: Option<u32>, total: &mut u64, missing: &mut bool) {
+    match value {
+        Some(value) => *total = total.saturating_add(value as u64),
+        None => *missing = true,
+    }
+}
+
+fn known_total(total: u64, missing: bool) -> Option<u32> {
+    (!missing).then_some(total.min(u32::MAX as u64) as u32)
+}
+
+fn failure_with_usage(error: impl std::fmt::Display, usage: &UsageAccumulator) -> anyhow::Error {
+    let (usage, status) = usage.finish();
+    let status = match status {
+        UsageStatus::Unknown => UsageStatus::Unknown,
+        _ => UsageStatus::Partial,
+    };
+    let diagnostic = serde_json::json!({
+        "status": status,
+        "input_tokens": usage.input_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "cache_write_input_tokens": usage.cache_write_input_tokens,
+        "output_tokens": usage.output_tokens,
+        "reasoning_output_tokens": usage.reasoning_output_tokens,
+        "total_tokens": usage.total_tokens,
+    });
+    anyhow::anyhow!("{error}; scout usage diagnostic: {}", diagnostic)
+}
 
 pub struct ScoutEngine {
     model: Arc<dyn ModelBackend>,
@@ -33,27 +153,47 @@ impl ScoutEngine {
     }
 
     pub async fn scout(&self, request: ScoutRequest) -> anyhow::Result<ScoutResult> {
+        crate::validate_request(&request)?;
+        anyhow::ensure!(
+            request.investigation.reasoning_effort.is_none(),
+            "per-investigation reasoning_effort requires a native Codex or Claude Code backend"
+        );
         let started = Instant::now();
-        let max_turns = request.max_turns.unwrap_or(self.budget.max_turns);
+        let max_turns = request
+            .investigation
+            .intent
+            .turn_limit(request.max_turns.unwrap_or(self.budget.max_turns));
         let total_timeout = request.timeout.or_else(|| self.budget.total_timeout());
-        let run = self.scout_inner(request, max_turns);
+        let observed_usage = Arc::new(Mutex::new(UsageAccumulator::default()));
+        let run = self.scout_inner(request, max_turns, Arc::clone(&observed_usage));
         let mut result = if let Some(total_timeout) = total_timeout {
             match tokio::time::timeout(total_timeout, run).await {
                 Ok(result) => result?,
                 Err(_) => {
+                    let usage = observed_usage.lock().unwrap_or_else(|e| e.into_inner());
+                    let (usage_stats, mut usage_status) = usage.finish();
+                    if usage_status != UsageStatus::Unknown {
+                        usage_status = UsageStatus::Partial;
+                    }
+                    let mut stats = ScoutStats {
+                        warm_process: false,
+                        thread_turn: 0,
+                        turns: 0,
+                        tool_calls: 0,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        model: self.model.name().to_string(),
+                        ..Default::default()
+                    };
+                    usage_stats.apply_to(&mut stats);
+                    stats.usage_status = usage_status;
                     return Ok(ScoutResult {
+                        investigation: crate::InvestigationReport {
+                            status: crate::InvestigationStatus::Failed,
+                            ..Default::default()
+                        },
                         summary: format!("Scout timed out after {}s.", total_timeout.as_secs()),
                         citations: vec![],
-                        stats: ScoutStats {
-                            turns: 0,
-                            tool_calls: 0,
-                            duration_ms: started.elapsed().as_millis() as u64,
-                            model: self.model.name().to_string(),
-                            prompt_tokens: None,
-                            cached_prompt_tokens: None,
-                            completion_tokens: None,
-                            reasoning_output_tokens: None,
-                        },
+                        stats,
                         raw_final: None,
                     });
                 }
@@ -69,12 +209,12 @@ impl ScoutEngine {
         &self,
         request: ScoutRequest,
         max_turns: u32,
+        observed_usage: Arc<Mutex<UsageAccumulator>>,
     ) -> anyhow::Result<ScoutResult> {
-        let root = request.root.clone();
-        let system = build_system_prompt(&root);
+        let system = build_system_prompt(&request.root);
         let mut messages = vec![
             ChatMessage::system(system),
-            ChatMessage::user(user_query_prompt(&request.query)),
+            ChatMessage::user(crate::investigation_prompt(&request)),
         ];
 
         let tool_specs: Vec<ToolSpec> = self
@@ -90,28 +230,26 @@ impl ScoutEngine {
 
         let mut turns: u32 = 0;
         let mut tool_calls_total: u32 = 0;
-        let mut prompt_tokens: u32 = 0;
-        let mut completion_tokens: u32 = 0;
+        let mut usage = UsageAccumulator::default();
         let mut correction_used = false;
-        let mut seen_tool_calls = HashSet::new();
 
         loop {
             turns += 1;
-            if turns > max_turns + 1 {
+            if max_turns > 0 && turns > max_turns.saturating_add(1) {
                 return Ok(empty_result(
                     &format!("No final answer after {max_turns} turns."),
                     turns - 1,
                     tool_calls_total,
                     self.model.name(),
-                    prompt_tokens,
-                    completion_tokens,
+                    &usage,
                 ));
             }
 
-            let final_turn = turns == max_turns + 1;
+            let final_turn = (max_turns > 0 && turns == max_turns.saturating_add(1))
+                || tool_calls_total >= self.budget.max_tool_calls;
             if final_turn {
                 messages.push(ChatMessage::user(
-                    "Max number of turns reached. Return the final answer now from gathered evidence, with no more tool calls.",
+                    "Configured investigation budget reached. Return the final answer now from gathered evidence, with no more tool calls.",
                 ));
             }
 
@@ -127,11 +265,12 @@ impl ScoutEngine {
                     temperature: self.model.temperature(),
                     max_tokens: None,
                 })
-                .await?;
+                .await
+                .map_err(|error| failure_with_usage(error, &usage))?;
 
             if let Some(u) = &response.usage {
-                prompt_tokens = prompt_tokens.saturating_add(u.prompt_tokens);
-                completion_tokens = completion_tokens.saturating_add(u.completion_tokens);
+                usage.add(u);
+                *observed_usage.lock().unwrap_or_else(|e| e.into_inner()) = usage.clone();
             }
 
             let msg = response.message;
@@ -139,11 +278,27 @@ impl ScoutEngine {
 
             if let Some(calls) = &msg.tool_calls {
                 if !calls.is_empty() {
+                    if final_turn {
+                        return Ok(empty_result(
+                            "The model requested more tools after the configured budget was exhausted.",
+                            turns,
+                            tool_calls_total,
+                            self.model.name(),
+                            &usage,
+                        ));
+                    }
                     if tool_calls_total as usize + calls.len() > self.budget.max_tool_calls as usize
                     {
                         warn!("max tool calls reached");
+                        for call in calls {
+                            messages.push(ChatMessage::tool(
+                                call.id.clone(),
+                                "Tool budget exhausted; this call was not executed.",
+                            ));
+                        }
+                        tool_calls_total = self.budget.max_tool_calls;
                         messages.push(ChatMessage::user(
-                            "Tool call budget exhausted. Provide your final_answer now.",
+                            "Tool call budget exhausted. Return the investigation JSON now, marking unresolved questions partial.",
                         ));
                         continue;
                     }
@@ -160,32 +315,15 @@ impl ScoutEngine {
                             ),
                         })
                         .collect();
-                    let mut fresh_calls = Vec::new();
-                    let mut duplicate_ids = HashSet::new();
                     for call in &tool_calls {
                         debug!(name = %call.name, arguments = %call.arguments, "model tool call");
-                        if seen_tool_calls.insert((call.name.clone(), call.arguments.clone())) {
-                            fresh_calls.push(call.clone());
-                        } else {
-                            duplicate_ids.insert(call.id.clone());
-                        }
                     }
 
-                    debug!(count = fresh_calls.len(), "executing tools concurrently");
-                    let results = self.tools.call_many(&fresh_calls).await;
+                    debug!(count = tool_calls.len(), "executing tools concurrently");
+                    let results = self.tools.call_many(&tool_calls).await;
                     tool_calls_total += results.len() as u32;
-                    let mut results: HashMap<_, _> = results
-                        .into_iter()
-                        .map(|result| (result.tool_call_id, result.output))
-                        .collect();
-
-                    for call in tool_calls {
-                        let output = if duplicate_ids.contains(&call.id) {
-                            "<system-reminder>This exact tool call already ran. Use the prior result, narrow the search, or provide the final answer.</system-reminder>".into()
-                        } else {
-                            results.remove(&call.id).unwrap_or_default()
-                        };
-                        messages.push(ChatMessage::tool(call.id, output));
+                    for result in results {
+                        messages.push(ChatMessage::tool(result.tool_call_id, result.output));
                     }
                     continue;
                 }
@@ -193,42 +331,35 @@ impl ScoutEngine {
 
             // Final assistant message (no tool calls).
             let content = msg.content.clone().unwrap_or_default();
-            let (summary, raw_citations) = parse_citations(&content);
-            let validated = validate_citations(&root, &raw_citations);
+            let (summary, validated, investigation) = assess_output(&request, &content);
 
             // One correction turn if claimed citations are invalid or malformed.
-            if validated.is_empty()
-                && !correction_used
-                && (!raw_citations.is_empty() || content.contains("<final_answer>"))
-            {
+            if validated.is_empty() && !correction_used && content.contains("<final_answer>") {
                 correction_used = true;
                 messages.push(ChatMessage::user(
-                    "The final_answer citations were missing or invalid. Return only one citation per line in the exact form `repository/path:START-END (reason)` inside <final_answer>. Correct paths or lines with tools if needed.",
+                    "The cited locations were invalid. Return investigation JSON with direct source evidence. Mark unresolved questions partial instead of inventing citations.",
                 ));
                 continue;
             }
 
+            let (usage_stats, usage_status) = usage.finish();
+            let mut stats = ScoutStats {
+                warm_process: false,
+                thread_turn: 0,
+                turns,
+                tool_calls: tool_calls_total,
+                duration_ms: 0,
+                model: self.model.name().to_string(),
+                ..Default::default()
+            };
+            usage_stats.apply_to(&mut stats);
+            stats.usage_status = usage_status;
+
             return Ok(ScoutResult {
+                investigation,
                 summary,
                 citations: validated,
-                stats: ScoutStats {
-                    turns,
-                    tool_calls: tool_calls_total,
-                    duration_ms: 0,
-                    model: self.model.name().to_string(),
-                    prompt_tokens: if prompt_tokens > 0 {
-                        Some(prompt_tokens)
-                    } else {
-                        None
-                    },
-                    cached_prompt_tokens: None,
-                    completion_tokens: if completion_tokens > 0 {
-                        Some(completion_tokens)
-                    } else {
-                        None
-                    },
-                    reasoning_output_tokens: None,
-                },
+                stats,
                 raw_final: Some(content),
             });
         }
@@ -271,6 +402,10 @@ fn sandbox_search_arguments(name: &str, arguments: &str, root: &Path) -> String 
         return arguments.to_string();
     };
 
+    if resolve_in_root(root, path).is_ok_and(|resolved| resolved.exists()) {
+        return arguments.to_string();
+    }
+
     let trimmed = path.trim_start_matches(['/', '\\']);
     let root_name = root.file_name().and_then(|name| name.to_str());
     let named_relative = root_name
@@ -310,30 +445,28 @@ fn empty_result(
     turns: u32,
     tool_calls: u32,
     model: &str,
-    prompt_tokens: u32,
-    completion_tokens: u32,
+    usage: &UsageAccumulator,
 ) -> ScoutResult {
+    let (usage_stats, usage_status) = usage.finish();
+    let mut stats = ScoutStats {
+        warm_process: false,
+        thread_turn: 0,
+        turns,
+        tool_calls,
+        duration_ms: 0,
+        model: model.into(),
+        ..Default::default()
+    };
+    usage_stats.apply_to(&mut stats);
+    stats.usage_status = usage_status;
     ScoutResult {
+        investigation: crate::InvestigationReport {
+            status: crate::InvestigationStatus::Partial,
+            ..Default::default()
+        },
         summary: summary.into(),
         citations: vec![],
-        stats: ScoutStats {
-            turns,
-            tool_calls,
-            duration_ms: 0,
-            model: model.into(),
-            prompt_tokens: if prompt_tokens > 0 {
-                Some(prompt_tokens)
-            } else {
-                None
-            },
-            cached_prompt_tokens: None,
-            completion_tokens: if completion_tokens > 0 {
-                Some(completion_tokens)
-            } else {
-                None
-            },
-            reasoning_output_tokens: None,
-        },
+        stats,
         raw_final: None,
     }
 }
@@ -341,10 +474,43 @@ fn empty_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use repotracer_model::{MockModel, MockScript, MockStep};
+    use repotracer_model::{
+        ChatMessage, MockModel, MockScript, MockStep, ModelError, ModelResponse,
+    };
+    use std::collections::VecDeque;
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    struct UsageModel {
+        responses: Mutex<VecDeque<Result<ModelResponse, ModelError>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelBackend for UsageModel {
+        fn name(&self) -> &str {
+            "usage-mock"
+        }
+
+        async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse, ModelError> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(ModelError::ScriptExhausted))
+        }
+    }
+
+    fn reported_usage(input: u32) -> Usage {
+        Usage {
+            prompt_tokens: Some(input),
+            cached_prompt_tokens: Some(input / 2),
+            cache_write_prompt_tokens: Some(input / 10),
+            completion_tokens: Some(input / 4),
+            reasoning_output_tokens: Some(input / 8),
+            total_tokens: Some(input + input / 4),
+        }
+    }
 
     #[tokio::test]
     async fn mock_end_to_end() {
@@ -381,6 +547,7 @@ mod tests {
         let engine = ScoutEngine::new(model, tools, ExplorerBudget::default());
         let result = engine
             .scout(ScoutRequest {
+                investigation: Default::default(),
                 query: "where is session handled?".into(),
                 root: dir.path().to_path_buf(),
                 focus: None,
@@ -394,6 +561,95 @@ mod tests {
         assert_eq!(result.citations[0].path, "src/auth/session.rs");
         assert!(result.stats.tool_calls >= 2);
         assert!(result.stats.turns >= 2);
+    }
+
+    #[tokio::test]
+    async fn usage_aggregates_each_generation_once() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn answer() {}\n").unwrap();
+        let model = Arc::new(UsageModel {
+            responses: Mutex::new(VecDeque::from([
+                Ok(ModelResponse {
+                    message: ChatMessage::assistant_tools(
+                        None,
+                        vec![repotracer_model::FunctionCall {
+                            id: "read".into(),
+                            name: "Read".into(),
+                            arguments: r#"{"path":"lib.rs"}"#.into(),
+                        }],
+                    ),
+                    model: "usage-mock".into(),
+                    usage: Some(reported_usage(100)),
+                }),
+                Ok(ModelResponse {
+                    message: ChatMessage::assistant(
+                        "<final_answer>\nlib.rs:1-1 (answer)\n</final_answer>",
+                    ),
+                    model: "usage-mock".into(),
+                    usage: Some(reported_usage(40)),
+                }),
+            ])),
+        });
+        let engine = ScoutEngine::new(model, RepoTools::new(dir.path()), ExplorerBudget::default());
+        let result = engine
+            .scout(ScoutRequest {
+                investigation: Default::default(),
+                query: "find answer".into(),
+                root: dir.path().to_path_buf(),
+                focus: None,
+                max_turns: Some(2),
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.stats.prompt_tokens, Some(140));
+        assert_eq!(result.stats.cached_prompt_tokens, Some(70));
+        assert_eq!(result.stats.cache_write_prompt_tokens, Some(14));
+        assert_eq!(result.stats.completion_tokens, Some(35));
+        assert_eq!(result.stats.reasoning_output_tokens, Some(17));
+        assert_eq!(result.stats.total_tokens, Some(175));
+        assert_eq!(result.stats.usage_status, UsageStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn failed_generation_surfaces_partial_usage_without_prompt_data() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn answer() {}\n").unwrap();
+        let model = Arc::new(UsageModel {
+            responses: Mutex::new(VecDeque::from([
+                Ok(ModelResponse {
+                    message: ChatMessage::assistant_tools(
+                        None,
+                        vec![repotracer_model::FunctionCall {
+                            id: "read".into(),
+                            name: "Read".into(),
+                            arguments: r#"{"path":"lib.rs"}"#.into(),
+                        }],
+                    ),
+                    model: "usage-mock".into(),
+                    usage: Some(reported_usage(100)),
+                }),
+                Err(ModelError::Request("provider stopped".into())),
+            ])),
+        });
+        let engine = ScoutEngine::new(model, RepoTools::new(dir.path()), ExplorerBudget::default());
+        let error = engine
+            .scout(ScoutRequest {
+                investigation: Default::default(),
+                query: "find answer".into(),
+                root: dir.path().to_path_buf(),
+                focus: None,
+                max_turns: Some(3),
+                timeout: None,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("scout usage diagnostic"));
+        assert!(error.contains("partial"));
+        assert!(error.contains("100"));
+        assert!(!error.contains("find answer"));
     }
 
     #[tokio::test]
@@ -412,6 +668,7 @@ mod tests {
 
         let result = engine
             .scout(ScoutRequest {
+                investigation: Default::default(),
                 query: "find answer".into(),
                 root: dir.path().to_path_buf(),
                 focus: None,
@@ -426,7 +683,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_tool_calls_are_not_executed_twice() {
+    async fn uncapped_turns_allow_investigation_beyond_six_reads() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn setup() {}\n").unwrap();
+        let mut steps =
+            vec![MockStep::Tools(vec![("Read".into(), r#"{"path":"a.rs"}"#.into())]); 8];
+        steps.push(MockStep::Final(
+            "<final_answer>\na.rs:1-1\n</final_answer>".into(),
+        ));
+        let engine = ScoutEngine::new(
+            Arc::new(MockModel::new(MockScript { steps })),
+            RepoTools::new(dir.path()),
+            ExplorerBudget::default(),
+        );
+        let result = engine
+            .scout(ScoutRequest {
+                investigation: Default::default(),
+                query: "inspect".into(),
+                root: dir.path().into(),
+                focus: None,
+                max_turns: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.stats.turns, 9);
+        assert_eq!(result.stats.tool_calls, 8);
+        assert_eq!(result.citations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn uncapped_turns_still_stop_when_model_ignores_tool_budget() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn setup() {}\n").unwrap();
+        let steps = vec![MockStep::Tools(vec![("Read".into(), r#"{"path":"a.rs"}"#.into())]); 2];
+        let engine = ScoutEngine::new(
+            Arc::new(MockModel::new(MockScript { steps })),
+            RepoTools::new(dir.path()),
+            ExplorerBudget {
+                max_tool_calls: 1,
+                ..Default::default()
+            },
+        );
+        let result = engine
+            .scout(ScoutRequest {
+                investigation: Default::default(),
+                query: "inspect".into(),
+                root: dir.path().into(),
+                focus: None,
+                max_turns: Some(0),
+                timeout: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.stats.turns, 2);
+        assert_eq!(result.stats.tool_calls, 1);
+        assert_eq!(
+            result.investigation.status,
+            crate::InvestigationStatus::Partial
+        );
+        assert!(result.summary.contains("budget was exhausted"));
+    }
+
+    #[tokio::test]
+    async fn repeated_reads_are_allowed_and_count_against_tool_budget() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.rs"), "fn setup() {}\n").unwrap();
         let repeated = ("Grep".into(), r#"{"pattern":"setup"}"#.into());
@@ -441,6 +761,7 @@ mod tests {
 
         let result = engine
             .scout(ScoutRequest {
+                investigation: Default::default(),
                 query: "find setup".into(),
                 root: dir.path().into(),
                 focus: None,
@@ -450,7 +771,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.stats.tool_calls, 1);
+        assert_eq!(result.stats.tool_calls, 2);
         assert_eq!(result.citations.len(), 1);
     }
 
@@ -468,6 +789,7 @@ mod tests {
 
         let result = engine
             .scout(ScoutRequest {
+                investigation: Default::default(),
                 query: "find setup".into(),
                 root: dir.path().into(),
                 focus: None,
