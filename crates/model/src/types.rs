@@ -108,13 +108,25 @@ pub struct ModelResponse {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub total_tokens: u32,
+    /// Provider-reported input tokens, including cached input where the
+    /// provider defines cached input as an input subset.
+    #[serde(default)]
+    pub prompt_tokens: Option<u32>,
+    #[serde(default)]
+    pub completion_tokens: Option<u32>,
+    #[serde(default)]
+    pub total_tokens: Option<u32>,
+    #[serde(default)]
+    pub cached_prompt_tokens: Option<u32>,
+    #[serde(default)]
+    pub cache_write_prompt_tokens: Option<u32>,
+    #[serde(default)]
+    pub reasoning_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
+    pub reasoning_effort: Option<String>,
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
@@ -127,6 +139,7 @@ pub struct ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
+            reasoning_effort: None,
             base_url: "https://api.openai.com/v1".into(),
             model: "gpt-5.6-luna".into(),
             api_key: None,

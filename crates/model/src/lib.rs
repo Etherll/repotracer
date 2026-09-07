@@ -8,5 +8,5 @@ pub use mock::{MockModel, MockScript, MockStep};
 pub use openai::OpenAiCompatBackend;
 pub use types::{
     ChatMessage, FunctionCall, MessageRole, ModelBackend, ModelConfig, ModelError, ModelRequest,
-    ModelResponse, ToolSpec,
+    ModelResponse, ToolSpec, Usage,
 };
