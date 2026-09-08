@@ -1,6 +1,10 @@
 # repotracer
 
-RepoTracer is an MCP server whose `repo_scout` tool runs an isolated, read-only Luna process and returns validated source citations to Codex Sol.
+RepoTracer is an MCP server for read-only repository investigations in Codex
+and Claude Code. Its `repo_scout` tool returns a model-authored report with
+source excerpts and validated file citations. Citation validation checks that
+locations exist inside the selected repository; it does not prove the report's
+conclusions.
 
 ## Setup
 
@@ -8,50 +12,86 @@ RepoTracer is an MCP server whose `repo_scout` tool runs an isolated, read-only 
 npx repotracer@latest setup
 ```
 
-The installer downloads the native binary, verifies its SHA-256 checksum, copies it to `~/.repotracer/bin/repotracer`, registers the stdio MCP server, and adds a managed routing block to `~/.codex/AGENTS.md`.
+In an interactive terminal, the v2 setup wizard lets you choose Codex, Claude
+Code, or both, then choose a scout model. Defaults are:
 
-Codex must already be installed, but you can set up RepoTracer before signing in.
-When a scout runs, RepoTracer reuses the current Codex login and provider instead
-of requiring another API key.
+- Codex parent -> Codex scout: `gpt-5.6-luna`
+- Claude Code parent -> Claude scout: `sonnet`
 
-```bash
-npm install -g @openai/codex
-npx repotracer@latest setup
-codex login
-repotracer doctor
-```
+These are defaults, not cost or quality promises. RepoTracer uses each native
+CLI's existing login. It does not require a second subscription key.
 
-Preview without changing files:
+For scripted setup:
 
 ```bash
-npx repotracer@latest setup --dry-run
+npx repotracer@latest setup --agents codex
+npx repotracer@latest setup --agents claude
+npx repotracer@latest setup --agents both --dry-run
 ```
 
-RepoTracer updates automatically. Restart Codex after an update for it to take
-effect. To disable automatic updates, set `updates.automatic = false` in
-`~/.repotracer/config.toml` or set `REPOTRACER_NO_UPDATE=1`. Running
-`npx repotracer@latest setup` still updates a disabled installation.
+The Codex integration requires the `codex` executable. The Claude Code
+integration requires `claude`. Setup checks that the executable is available;
+the native CLI handles authentication when a scout runs. Restart the parent
+agent after setup.
+
+## Settings
+
+```bash
+repotracer settings
+```
+
+The TUI uses two steps. First choose the parent integrations. Then accept
+recommended models or keep saved choices. Open `Advanced` to search and
+review a different provider/model for each parent. The
+custom format is `codex:model-id` or `claude:model-id`. Esc and Ctrl-C cancel,
+and nothing is written before the final save.
+
+For automation, use explicit settings flags:
+
+```bash
+repotracer settings --agents both \
+  --codex-scout codex --codex-model gpt-5.6-luna \
+  --claude-scout claude --claude-model sonnet
+```
+
+Use `--dry-run` to preview changes. Parent profiles are independent.
 
 ## Commands
 
 ```bash
-repotracer "where is auth handled?"
-repotracer scout "trace refresh token rotation"
+repotracer "where is authentication handled?"
+repotracer scout "trace token refresh" --intent diagnose
+repotracer symbols "Config" --mode references
+repotracer serve
 repotracer doctor
 repotracer status
+repotracer update
 repotracer uninstall --yes
 ```
 
-## Permanent install
+`serve` runs the MCP server over stdio. `symbols` performs a local syntax
+lookup without a model call. Add `--json` to `scout`, `doctor`, or `status`.
 
-```bash
-npm install -g repotracer
-# or
-cargo install --git https://github.com/repotracer/repotracer --locked repotracer
-```
+The MCP tool requires `query`; `repository`, `focus`, and `investigation` are
+optional. Related follow-ups can pass the returned
+`conversation.id` as `investigation.conversation_id`. Claude uses Read, Grep,
+and Glob; Codex uses a read-only shell and optional Symbols lookup. Neither
+scout receives editing tools or external MCP servers.
 
-Supported platforms: macOS arm64 and x64, Linux arm64 and x64, and Windows x64. Node.js 18 or newer.
+## Timeouts and support
 
-Read the [documentation and benchmarks](https://github.com/repotracer/repotracer).
+Warm provider processes may be retained for related work. `session.idle_secs`
+retires an inactive warm process; it is not a total request timeout. The
+optional `model.timeout_ms` limit measures stream inactivity, while
+`explorer.timeout_seconds` limits a whole investigation only in the generic
+OpenAI-compatible engine, not the native scouts. Both default to zero.
 
-MIT licensed.
+Node.js 18 or newer is required for the launcher. Published native packages
+target macOS arm64 and x64, Linux arm64 and x64, and Windows x64. The v2
+release candidate has local Linux verification; macOS and Windows CI checks
+are pending.
+
+RepoTracer does not promise lower cost, faster completion, or a particular
+answer quality. Provider and parent-agent behavior affect each result.
+
+MIT licensed. See the [repository documentation](https://github.com/repotracer/repotracer).

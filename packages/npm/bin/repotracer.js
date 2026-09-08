@@ -35,7 +35,7 @@ function findBinary() {
 }
 
 function persistForSetup(bin, args, home = os.homedir()) {
-  if (!path.isAbsolute(bin) || !args.includes('setup') || args.includes('--dry-run')) return bin;
+  if (!path.isAbsolute(bin) || !args.some(arg => ['setup', 'settings', 'reconfigure'].includes(arg)) || args.includes('--dry-run')) return bin;
 
   const name = process.platform === 'win32' ? 'repotracer.exe' : 'repotracer';
   const directory = path.join(home, '.repotracer', 'bin');
