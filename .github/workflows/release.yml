@@ -8,6 +8,9 @@ permissions:
   contents: write
 
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
   upgrade:
     runs-on: ubuntu-latest
     steps:
@@ -19,7 +22,7 @@ jobs:
         run: python3 scripts/test-version-upgrade.py
 
   build:
-    needs: upgrade
+    needs: [checks, upgrade]
     strategy:
       matrix:
         include:

@@ -1,12 +1,16 @@
 name: ci
 
 on:
+  workflow_call:
   push:
     branches: [main]
     # Docs, assets, and the marketing copy cannot break the build, so they must
     # not spin up three Rust toolchains.
     paths-ignore:
-      - '**.md'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'CONTRIBUTING.md'
+      - 'BENCHMARKS.md'
       - 'docs/**'
       - 'assets/**'
       - 'benchmarks/results/**'
@@ -16,7 +20,10 @@ on:
       - '.github/PULL_REQUEST_TEMPLATE.md'
   pull_request:
     paths-ignore:
-      - '**.md'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'CONTRIBUTING.md'
+      - 'BENCHMARKS.md'
       - 'docs/**'
       - 'assets/**'
       - 'benchmarks/results/**'
@@ -30,6 +37,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -53,13 +61,14 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ripgrep
       - name: Install Codex CLI
-        run: npm install --global @openai/codex@0.149.1
+        run: npm install --global @openai/codex@0.153.4
       - name: Test
         run: cargo test --workspace
       - name: Real Codex app-server repository read
         run: |
           cargo build -p repotracer
           python3 scripts/codex-app-server-smoke.py
+          REPOTRACER_SMOKE_SYMBOLS=1 python3 scripts/codex-app-server-smoke.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Fmt
@@ -94,7 +103,7 @@ jobs:
       - name: Install ripgrep
         run: choco install ripgrep -y
       - name: Install Codex CLI
-        run: npm install --global @openai/codex@0.149.1
+        run: npm install --global @openai/codex@0.153.4
       - name: Test
         run: cargo test --workspace
       - name: Real Codex app-server repository read

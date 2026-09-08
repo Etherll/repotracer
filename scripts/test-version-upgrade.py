@@ -36,7 +36,10 @@ def run(*args: str | Path, cwd: Path = ROOT, env: dict[str, str] | None = None) 
 
 def binary(root: Path) -> Path:
     name = "repotracer.exe" if os.name == "nt" else "repotracer"
-    return root / "target" / "debug" / name
+    target = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
+    if not target.is_absolute():
+        target = root / target
+    return target / "debug" / name
 
 
 def asset_name() -> str:
@@ -62,7 +65,7 @@ def version(executable: Path, env: dict[str, str] | None = None) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--from-tag", default="v1.0.0")
-    parser.add_argument("--to-version", default="1.0.1")
+    parser.add_argument("--to-version", default="2.0.0")
     args = parser.parse_args()
 
     run("git", "rev-parse", "--verify", args.from_tag)
@@ -165,7 +168,7 @@ def main() -> None:
             "single MCP entry": refreshed_config.count("[mcp_servers.repotracer]") == 1,
             "user instructions": "Never remove this line." in refreshed_agents,
             "current routing block": refreshed_agents.count("<!-- repotracer:start -->") == 1
-            and "Examples that stay local" in refreshed_agents,
+            and "query alone is enough" in refreshed_agents,
         }
         failed = [name for name, passed in checks.items() if not passed]
         if failed:

@@ -1,0 +1,35 @@
+name: repository hygiene
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  repository-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Keep private research out of product history
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          base = os.environ.get("BASE_SHA", "")
+          revision = f"{base}..HEAD" if base and set(base) != {"0"} else "HEAD"
+          paths = subprocess.check_output(
+              ["git", "log", revision, "--diff-filter=ACMR", "--format=", "--name-only"],
+              text=True,
+          ).splitlines()
+          forbidden = re.compile(r"(^|/)(research|benchmarks)/|^crates/bench/|^docs/(\.internal|launch)/|^BENCHMARKS\.md$|^benchmarks\.html$|^scripts/summarize-results(?:\.py)?$|^assets/(button-benchmarks\.svg|benchmark-card\.png|results-proof\.png)$")
+          found = sorted({path for path in paths if forbidden.search(path)})
+          if found:
+              raise SystemExit("Private artifacts remain in Git history:\n" + "\n".join(found))
+          print("Product history contains no private research or benchmark files.")
+          PY
