@@ -4,6 +4,7 @@
 mod exec;
 mod glob_tool;
 mod grep;
+mod index;
 mod pathutil;
 mod read;
 mod types;
@@ -11,6 +12,7 @@ mod types;
 pub use exec::{execute_tools, ToolExecutor, DEFAULT_CONCURRENCY, DEFAULT_TOOL_TIMEOUT};
 pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
+pub use index::{RepositoryIndex, SymbolOccurrence};
 pub use pathutil::{is_within_root, resolve_in_root, PathError};
 pub use read::ReadTool;
 pub use types::{
@@ -28,6 +30,7 @@ pub struct RepoTools {
     read: Arc<ReadTool>,
     glob: Arc<GlobTool>,
     grep: Arc<GrepTool>,
+    index: RepositoryIndex,
     concurrency: usize,
     timeout: Duration,
 }
@@ -39,6 +42,7 @@ impl RepoTools {
             read: Arc::new(ReadTool::new(root.clone())),
             glob: Arc::new(GlobTool::new(root.clone())),
             grep: Arc::new(GrepTool::new(root.clone())),
+            index: RepositoryIndex::new(root.clone()),
             root,
             concurrency: DEFAULT_CONCURRENCY,
             timeout: DEFAULT_TOOL_TIMEOUT,
@@ -60,7 +64,12 @@ impl RepoTools {
     }
 
     pub fn schemas(&self) -> Vec<ToolSchema> {
-        vec![self.read.schema(), self.glob.schema(), self.grep.schema()]
+        vec![
+            self.read.schema(),
+            self.glob.schema(),
+            self.grep.schema(),
+            self.index.schema(),
+        ]
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -80,6 +89,7 @@ impl RepoTools {
             "Read" => self.read.call(arguments).await,
             "Glob" => self.glob.call(arguments).await,
             "Grep" => self.grep.call(arguments).await,
+            "Symbols" => self.index.call(arguments).await,
             other => Err(ToolError::UnknownTool(other.to_string())),
         };
         match output {
