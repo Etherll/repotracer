@@ -120,6 +120,12 @@ limits, repository, and parent-agent decisions. The Claude backend does not
 provide the optional RepoTracer Symbols operation as a native scout tool;
 `repotracer symbols` remains a separate local CLI command.
 
+Automated CI covers the Codex backend against a real native CLI. The Claude
+backend has no CI coverage against a real `claude` executable, because CI has
+no native CLI login. `scripts/subscription-smoke.py --backend claude-cli` is the
+check that exercises it end to end over MCP; see the native CLI smoke checks
+section of `CONTRIBUTING.md` for how and when to run it.
+
 The v2 release candidate has local Linux verification. macOS and Windows CI
 verification is pending. Native CLI versions can expose different model
 catalog entries or flags. Unsupported native options fail closed rather than

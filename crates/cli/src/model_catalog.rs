@@ -11,11 +11,12 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdout, Command},
+    process::{Child, ChildStderr, ChildStdout, Command},
 };
 
 /// A model that a subscription CLI reports as selectable.
@@ -200,7 +201,7 @@ const MAX_PAGES: usize = 16;
 const MAX_MODELS: usize = 512;
 const MAX_PROTOCOL_LINE_BYTES: usize = 1024 * 1024;
 const MAX_CLAUDE_OUTPUT_BYTES: usize = 1024 * 1024;
-const CLAUDE_API_ENVIRONMENT: &[&str] = &[
+pub(crate) const CLAUDE_API_ENVIRONMENT: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
@@ -208,6 +209,103 @@ const CLAUDE_API_ENVIRONMENT: &[&str] = &[
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
 ];
+
+/// Safety and isolation flags shared by every Claude Code invocation: the
+/// scout transport and both discovery probes.
+///
+/// These flags define the permission posture, so they live in one place for
+/// the same reason `CLAUDE_API_ENVIRONMENT` does — a flag added to one call
+/// site and forgotten at another silently weakens the others. The tool list
+/// is deliberately not part of this set: discovery runs with no tools at all
+/// (`--tools ""`) while the scout allows `Read,Grep,Glob`.
+pub(crate) const CLAUDE_READ_ONLY_FLAGS: &[&str] = &[
+    "--no-session-persistence",
+    "--safe-mode",
+    "--setting-sources",
+    "",
+    "--strict-mcp-config",
+    "--mcp-config",
+    r#"{"mcpServers":{}}"#,
+    "--permission-mode",
+    "dontAsk",
+];
+
+/// Bytes of child stderr retained for diagnostics. A few KiB is enough for a
+/// CLI usage error or stack trace and bounds what an error message can carry.
+const STDERR_TAIL_BYTES: usize = 4 * 1024;
+
+/// Bounded capture of a child process's stderr.
+///
+/// Native CLI diagnostics are the only evidence available when a provider
+/// renames or removes a flag, so failures must be able to quote them. Two
+/// properties matter:
+///
+/// * A reader task drains the pipe continuously and keeps only the last
+///   [`STDERR_TAIL_BYTES`], so a chatty child can neither fill the pipe buffer
+///   and deadlock nor grow this buffer without bound.
+/// * The tail is surfaced only through [`StderrTail::diagnostic`], which
+///   callers use on failure paths. Stderr can contain user-identifying paths
+///   and is never reported when a request succeeds.
+pub(crate) struct StderrTail {
+    tail: Arc<Mutex<Vec<u8>>>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StderrTail {
+    /// Start draining `stderr` on a background task. `None` (stderr was not
+    /// piped) yields a tail that simply stays empty.
+    pub(crate) fn drain(stderr: Option<ChildStderr>) -> Self {
+        let tail = Arc::new(Mutex::new(Vec::new()));
+        let reader = stderr.map(|mut stderr| {
+            let sink = Arc::clone(&tail);
+            tokio::spawn(async move {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            let mut sink = sink.lock().unwrap_or_else(|error| error.into_inner());
+                            sink.extend_from_slice(&chunk[..read]);
+                            let excess = sink.len().saturating_sub(STDERR_TAIL_BYTES);
+                            if excess > 0 {
+                                sink.drain(..excess);
+                            }
+                        }
+                    }
+                }
+            })
+        });
+        Self { tail, reader }
+    }
+
+    /// The captured tail collapsed onto one line for embedding in an error.
+    fn text(&self) -> String {
+        let tail = self.tail.lock().unwrap_or_else(|error| error.into_inner());
+        String::from_utf8_lossy(&tail)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// Suffix describing what the child wrote to stderr, or an empty string
+    /// when it said nothing. Waits a bounded moment for the reader to observe
+    /// EOF — kill the child first — and then gives up rather than delaying the
+    /// caller. Abandoning the task is safe: it holds only the read end and
+    /// exits on its own at EOF.
+    pub(crate) async fn diagnostic(&mut self) -> String {
+        if let Some(reader) = self.reader.take() {
+            let _ = tokio::time::timeout(Duration::from_millis(200), reader).await;
+        }
+        let tail = self.text();
+        if tail.is_empty() {
+            String::new()
+        } else {
+            format!("; CLI stderr: {tail}")
+        }
+    }
+}
 
 // These are aliases accepted in native Claude model-picker output. They do
 // not form a fallback catalog. A model is selectable only when the native CLI
@@ -751,7 +849,22 @@ async fn read_limited_line(
 }
 
 async fn discover_claude_efforts(executable: &Path, model: &str) -> Result<Option<Vec<String>>> {
-    if claude_api_configuration_reason().is_some() {
+    discover_claude_efforts_for(executable, model, claude_api_configuration_reason()).await
+}
+
+/// Probe Claude Code for the effort levels it reports for `model`.
+///
+/// `direct_api_credential` names the environment variable that configures a
+/// direct-API credential, or `None` when the subscription path applies. It is
+/// a parameter rather than an ambient environment read so tests can drive both
+/// outcomes deterministically without mutating the process-global environment,
+/// which is unsound in a multithreaded test binary.
+async fn discover_claude_efforts_for(
+    executable: &Path,
+    model: &str,
+    direct_api_credential: Option<&str>,
+) -> Result<Option<Vec<String>>> {
+    if direct_api_credential.is_some() {
         return Ok(None);
     }
     let mut command = Command::new(executable);
@@ -763,23 +876,14 @@ async fn discover_claude_efforts(executable: &Path, model: &str) -> Result<Optio
             "--output-format",
             "stream-json",
             "--verbose",
-            "--no-session-persistence",
-            "--safe-mode",
-            "--setting-sources",
-            "",
-            "--strict-mcp-config",
-            "--mcp-config",
-            r#"{"mcpServers":{}}"#,
-            "--tools",
-            "",
-            "--permission-mode",
-            "dontAsk",
-            "--model",
-            model,
         ])
+        .args(CLAUDE_READ_ONLY_FLAGS)
+        .args(["--tools", "", "--model", model])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Keep the CLI's own diagnostics: a renamed or removed flag is
+        // otherwise indistinguishable from "not signed in".
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     // Do not let a direct API credential silently change the subscription
     // discovery path. Native Claude Code still owns OAuth/keychain login.
@@ -789,9 +893,14 @@ async fn discover_claude_efforts(executable: &Path, model: &str) -> Result<Optio
     let mut child = command
         .spawn()
         .with_context(|| format!("start `{}`", executable.display()))?;
+    let mut stderr = StderrTail::drain(child.stderr.take());
     let result = discover_claude_effort_child(&mut child, model).await;
     finish_child(&mut child).await;
-    result
+    match result {
+        Ok(efforts) => Ok(efforts),
+        // Only failures quote stderr; it can carry user paths.
+        Err(error) => Err(anyhow!("{error}{}", stderr.diagnostic().await)),
+    }
 }
 
 async fn discover_claude_effort_child(
@@ -911,29 +1020,26 @@ fn parse_claude_effort_levels(entry: &Value) -> Option<Vec<String>> {
 }
 
 async fn discover_claude(executable: &PathBuf) -> Result<Vec<ModelChoice>> {
-    if let Some(reason) = claude_api_configuration_reason() {
-        bail!(reason);
+    discover_claude_for(executable, claude_api_configuration_reason()).await
+}
+
+/// Ask Claude Code's model picker which models this account may select.
+///
+/// `direct_api_credential` is threaded in for the same reason as in
+/// [`discover_claude_efforts_for`]: the decision is a parameter, not an
+/// ambient environment read, so tests need not mutate the environment.
+async fn discover_claude_for(
+    executable: &PathBuf,
+    direct_api_credential: Option<&str>,
+) -> Result<Vec<ModelChoice>> {
+    if let Some(reason) = direct_api_credential {
+        bail!("{reason}");
     }
     let mut command = Command::new(executable);
     command
-        .args([
-            "--print",
-            "--output-format",
-            "json",
-            "--no-session-persistence",
-            "--safe-mode",
-            "--setting-sources",
-            "",
-            "--strict-mcp-config",
-            "--mcp-config",
-            r#"{"mcpServers":{}}"#,
-            "--tools",
-            "",
-            "--permission-mode",
-            "dontAsk",
-            "-p",
-            "/model",
-        ])
+        .args(["--print", "--output-format", "json"])
+        .args(CLAUDE_READ_ONLY_FLAGS)
+        .args(["--tools", "", "-p", "/model"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1063,6 +1169,43 @@ async fn finish_child(child: &mut Child) {
 async fn kill_and_reap(child: &mut Child) {
     let _ = child.kill().await;
     let _ = child.wait().await;
+}
+
+/// Create an executable test fixture at `path` without ever holding a writable
+/// descriptor to it in this process.
+///
+/// `fs::write` followed by `exec` races with the rest of the test binary:
+/// another thread's `Command::spawn` forks while this thread still holds the
+/// fixture open for writing, the forked child inherits that descriptor, and
+/// our `exec` of the fixture fails with `ETXTBSY` ("Text file busy"). Handing
+/// the write to a short-lived child keeps the descriptor out of this process
+/// entirely, so no fork of ours can hold the fixture open. The writer has
+/// exited by the time this returns, so nothing holds it open anywhere.
+///
+/// Routing the fixture through `sh <script>` instead would avoid the exec
+/// altogether, but the code under test takes an executable *path* and appends
+/// its own arguments, so the fixture has to be directly executable.
+#[cfg(all(test, unix))]
+pub(crate) fn write_executable_fixture(path: &Path, script: &str) {
+    use std::io::Write;
+    let mut writer = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn fixture writer");
+    writer
+        .stdin
+        .take()
+        .expect("fixture writer stdin")
+        .write_all(script.as_bytes())
+        .expect("write fixture");
+    let status = writer.wait().expect("await fixture writer");
+    assert!(
+        status.success(),
+        "fixture writer failed: {}",
+        path.display()
+    );
 }
 
 #[cfg(test)]
@@ -1260,7 +1403,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn auth_detection_distinguishes_missing_signed_out_and_unknown() {
-        use std::{fs, os::unix::fs::PermissionsExt};
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("native-fake");
         assert_eq!(
@@ -1278,12 +1420,10 @@ mod tests {
             ),
             ("printf '%s\\n' 'invalid'", AuthStatus::Unavailable),
         ] {
-            fs::write(
+            write_executable_fixture(
                 &executable,
-                format!("#!/bin/sh\n[ \"$*\" = \"auth status --json\" ] || exit 9\n{body}\n"),
-            )
-            .unwrap();
-            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+                &format!("#!/bin/sh\n[ \"$*\" = \"auth status --json\" ] || exit 9\n{body}\n"),
+            );
             assert_eq!(native_auth_status("claude", &executable).await, expected);
         }
         assert!(auth_warning("Claude Code", AuthStatus::MissingCli).contains("CLI not found"));
@@ -1293,11 +1433,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fake_codex_app_server_stream_is_paginated_and_cleaned_up() {
-        use std::{fs, os::unix::fs::PermissionsExt};
-
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("codex-fake");
-        fs::write(
+        write_executable_fixture(
             &executable,
             r##"#!/bin/sh
 read line
@@ -1308,9 +1446,7 @@ printf '%s\n' '{"id":101,"result":{"data":[{"id":"gpt-one","displayName":"One","
 read line
 printf '%s\n' '{"id":102,"result":{"data":[{"model":"gpt-two"}],"nextCursor":null}}'
 "##,
-        )
-        .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1333,25 +1469,24 @@ printf '%s\n' '{"id":102,"result":{"data":[{"model":"gpt-two"}],"nextCursor":nul
     #[cfg(unix)]
     #[test]
     fn fake_claude_cli_picker_is_catalog_only() {
-        use std::{fs, os::unix::fs::PermissionsExt};
-
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("claude-fake");
-        fs::write(
+        write_executable_fixture(
             &executable,
             r##"#!/bin/sh
 printf '%s\n' '{"type":"result","result":"Current model: Sonnet 5 (default)\nAvailable: sonnet, opus, claude-sonnet-5-20250101"}'
 "##,
-        )
-        .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        // The subscription decision is passed in, so this asserts the same
+        // behavior whether or not the developer running it has a direct API
+        // credential exported.
         let models = runtime
-            .block_on(discover_claude(&executable))
+            .block_on(discover_claude_for(&executable, None))
             .expect("fake Claude picker should succeed");
         assert_eq!(
             models
@@ -1360,16 +1495,19 @@ printf '%s\n' '{"type":"result","result":"Current model: Sonnet 5 (default)\nAva
                 .collect::<Vec<_>>(),
             ["sonnet", "opus", "claude-sonnet-5-20250101"]
         );
+        // A configured direct-API credential still refuses the picker.
+        let refused = runtime
+            .block_on(discover_claude_for(&executable, Some("ANTHROPIC_API_KEY")))
+            .unwrap_err();
+        assert!(refused.to_string().contains("ANTHROPIC_API_KEY"));
     }
 
     #[cfg(unix)]
     #[test]
     fn fake_claude_stream_json_probe_sends_initialize_without_user_message() {
-        use std::{fs, os::unix::fs::PermissionsExt};
-
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("claude-fake-stream");
-        fs::write(
+        write_executable_fixture(
             &executable,
             r##"#!/bin/sh
 case " $* " in
@@ -1387,14 +1525,67 @@ case "$request" in
 esac
 printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"probe-init","response":{"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-4-5-20250929","supportedEffortLevels":["low","medium","high"]}]}}}'
 "##,
-        )
-        .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
-        let efforts = discover_efforts("claude", Some(executable.to_str().unwrap()), "sonnet");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Subscription path, independent of the ambient environment.
+        let efforts = runtime
+            .block_on(discover_claude_efforts_for(&executable, "sonnet", None))
+            .expect("fake Claude probe should succeed");
         assert_eq!(
             efforts,
             Some(vec!["low".into(), "medium".into(), "high".into()])
+        );
+        // A configured direct-API credential reports no capability evidence
+        // rather than guessing one.
+        assert_eq!(
+            runtime
+                .block_on(discover_claude_efforts_for(
+                    &executable,
+                    "sonnet",
+                    Some("ANTHROPIC_API_KEY")
+                ))
+                .unwrap(),
+            None
+        );
+        // The provider dispatch in `discover_efforts` only answers for
+        // providers it can actually probe.
+        assert_eq!(
+            discover_efforts("mystery", Some(executable.to_str().unwrap()), "sonnet"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_effort_probe_reports_cli_stderr_in_its_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("claude-fake-drift");
+        write_executable_fixture(
+            &executable,
+            // Read the probe request before exiting, so the failure is the
+            // stream ending without a response rather than a broken pipe.
+            "#!/bin/sh\necho 'error: unknown option --strict-mcp-config' >&2\nIFS= read -r line\nexit 64\n",
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(discover_claude_efforts_for(&executable, "sonnet", None))
+            .expect_err("a CLI that rejects our flags must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("closed its output"),
+            "kept the transport reason: {message}"
+        );
+        assert!(
+            message.contains("unknown option --strict-mcp-config"),
+            "surfaced the CLI diagnostic: {message}"
         );
     }
 }

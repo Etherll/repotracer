@@ -16,6 +16,7 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SCAN_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OCCURRENCES: usize = 2_000;
 const MAX_CACHED_OCCURRENCES: usize = 50_000;
+const MAX_ITEM_BYTES: usize = 20 * 1024;
 const QUERY_REVISION: &str = "tags-v1-ts0247-rs0232-py0236-js0231-ts0232-go0234";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,21 +320,11 @@ impl RepositoryIndex {
                     && (args.mode == "outline" || o.definition == (args.mode == "definitions"))
             })
             .collect();
-        let mut items = Vec::new();
-        let mut bytes = 0;
-        for occurrence in matches
-            .iter()
-            .skip(args.offset)
-            .take(args.limit.clamp(1, 100))
-        {
-            let value = serde_json::to_value(occurrence)?;
-            let size = value.to_string().len();
-            if bytes + size > 20 * 1024 {
-                break;
-            }
-            bytes += size;
-            items.push(value);
-        }
+        let items = page_items(
+            matches.iter().copied(),
+            args.offset,
+            args.limit.clamp(1, 100),
+        )?;
         let next = args.offset.saturating_add(items.len());
         let mut output = json!({"source":"tree-sitter-tags", "query_revision":QUERY_REVISION,
             "relationship_precision":"syntactic occurrences only; no cross-file binding or completeness guarantee",
@@ -362,6 +353,31 @@ impl RepositoryIndex {
             output_bytes,
         ))
     }
+}
+
+/// Serialize one page of occurrences under the item byte budget.
+///
+/// The page always contains at least one item when the requested range is not
+/// empty, even if that single occurrence exceeds the budget on its own. An
+/// empty page would leave `next_offset` equal to the caller's own offset, so a
+/// client that follows `next_offset` would page forever without progress.
+fn page_items<'a>(
+    matches: impl Iterator<Item = &'a SymbolOccurrence>,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>, ToolError> {
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut bytes = 0;
+    for occurrence in matches.skip(offset).take(limit) {
+        let value = serde_json::to_value(occurrence)?;
+        let size = value.to_string().len();
+        if !items.is_empty() && bytes + size > MAX_ITEM_BYTES {
+            break;
+        }
+        bytes += size;
+        items.push(value);
+    }
+    Ok(items)
 }
 
 fn language_key(path: &Path) -> Option<&'static str> {
@@ -469,5 +485,46 @@ mod tests {
         assert_eq!(second.1, 0);
         assert_eq!(second.2, 1);
         assert!(!second.3);
+    }
+
+    fn occurrence(name: &str) -> SymbolOccurrence {
+        SymbolOccurrence {
+            path: "a.rs".into(),
+            name: name.into(),
+            kind: "function".into(),
+            definition: true,
+            start_line: 1,
+            end_line: 1,
+            start_byte: 0,
+            end_byte: 1,
+            fingerprint: "f".into(),
+        }
+    }
+
+    #[test]
+    fn a_page_always_advances_past_an_oversized_occurrence() {
+        // Serializes to more than the item budget on its own. The name cap in
+        // `query` keeps this out of reach today, so the guard is checked here
+        // rather than through a repository fixture.
+        let huge = occurrence(&"a".repeat(MAX_ITEM_BYTES + 1));
+        let small = occurrence("alpha");
+
+        // An empty page would report next_offset == offset and loop a client
+        // that follows it.
+        let matches = [huge.clone(), small.clone(), small.clone()];
+        let first = page_items(matches.iter(), 0, 30).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["name"], huge.name);
+        assert_eq!(page_items(matches.iter(), 1, 30).unwrap().len(), 2);
+
+        // The budget still ends a page that already carries an item.
+        let matches = [small.clone(), huge.clone(), small.clone()];
+        assert_eq!(page_items(matches.iter(), 0, 30).unwrap().len(), 1);
+
+        // Ordinary pages are unaffected.
+        let matches = [small.clone(), small.clone(), small];
+        assert_eq!(page_items(matches.iter(), 0, 30).unwrap().len(), 3);
+        assert_eq!(page_items(matches.iter(), 1, 1).unwrap().len(), 1);
+        assert!(page_items(matches.iter(), 3, 30).unwrap().is_empty());
     }
 }

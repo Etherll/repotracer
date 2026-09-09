@@ -33,6 +33,10 @@ jobs:
           forbidden = re.compile(r"(^|/)(research|benchmarks)/|^crates/bench/|^docs/(\.internal|launch)/|^BENCHMARKS\.md$|^benchmarks\.html$|^scripts/summarize-results(?:\.py)?$|^assets/(button-benchmarks\.svg|benchmark-card\.png|results-proof\.png)$")
           found = sorted({path for path in paths if forbidden.search(path)})
           if found:
-              raise SystemExit("Private artifacts remain in Git history:\n" + "\n".join(found))
-          print("Product history contains no private research or benchmark files.")
+              raise SystemExit(
+                  "Private artifacts added or modified by this change:\n"
+                  + "\n".join(found)
+                  + "\n(this check reads only the commits under review, not the whole history)"
+              )
+          print("No private research or benchmark files were added or modified by this change.")
           PY

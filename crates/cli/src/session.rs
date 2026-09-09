@@ -1516,7 +1516,7 @@ async fn kill_process_tree(child: &mut Child, process_group: Option<u32>) {
 }
 
 #[cfg(unix)]
-fn kill_process_group(process_group: u32) {
+pub(crate) fn kill_process_group(process_group: u32) {
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
     }
@@ -1528,7 +1528,7 @@ fn kill_process_group(process_group: u32) {
 }
 
 #[cfg(windows)]
-fn kill_process_group(process_group: u32) {
+pub(crate) fn kill_process_group(process_group: u32) {
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &process_group.to_string(), "/T", "/F"])
         .stdout(Stdio::null())

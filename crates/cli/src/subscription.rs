@@ -940,6 +940,66 @@ done
         );
     }
 
+    /// A fake provider writes the PID of a descendant it forked. `kill -0`
+    /// also succeeds for an unreaped zombie, so ask for the process state
+    /// instead: a killed descendant that has not been reaped yet is `Z`, and a
+    /// leaked one is still runnable. Missing `ps` panics rather than silently
+    /// reporting every descendant as dead.
+    #[cfg(unix)]
+    fn descendant_is_alive(pid: i32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .expect("`ps` is required to observe descendant processes");
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    /// Wait for a fake provider to publish its descendant's PID. The script
+    /// writes to a temporary name and renames, so any content that appears is
+    /// complete.
+    #[cfg(unix)]
+    async fn descendant_pid(path: &Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    return pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fake provider never recorded a descendant PID at {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Poll instead of sleeping a fixed window: a busy runner may need longer
+    /// than the kill itself does, but a descendant that is genuinely leaked
+    /// stays alive for its full sleep and still fails here.
+    #[cfg(unix)]
+    async fn assert_descendant_dies(pid: i32, message: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while descendant_is_alive(pid) {
+            assert!(Instant::now() < deadline, "{message} (pid {pid})");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A `/bin/sh` provider that forks a long-lived descendant, records its
+    /// PID, and then runs `last_line`. Killing only the direct child leaves
+    /// the recorded PID alive; killing the process group does not.
+    #[cfg(unix)]
+    fn descendant_probe_script(pid_path: &Path, last_line: &str) -> String {
+        format!(
+            "#!/bin/sh\nsleep 120 &\necho $! > '{pid}.tmp'\nmv '{pid}.tmp' '{pid}'\n{last_line}\n",
+            pid = pid_path.display()
+        )
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn activity_extends_idle_deadline_and_silence_kills_tree() {
@@ -961,13 +1021,13 @@ while IFS= read -r line; do
     3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-1"}}}' ;;
     4)
       printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-1","status":"inProgress","items":[]}}}'
-      sleep 0.1
+      sleep 0.6
       printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"commandExecution"},"threadId":"thread-1","turnId":"turn-1","completedAtMs":1}}'
-      sleep 0.1
+      sleep 0.6
       printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"{\"answer\":\"found\",\"citations\":[{\"path\":\"source.rs\",\"start_line\":1,\"end_line\":1,\"reason\":\"entry\"}]}"},"threadId":"thread-1","turnId":"turn-1","completedAtMs":2}}'
-      sleep 0.1
+      sleep 0.6
       printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":100,"cachedInputTokens":40,"outputTokens":20,"reasoningOutputTokens":5,"totalTokens":120}}}}'
-      sleep 0.1
+      sleep 0.6
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed","items":[]}}}'
       ;;
   esac
@@ -977,8 +1037,12 @@ done
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        // Each gap is 0.6s under a 2s idle limit and the turn as a whole runs
+        // past that limit, so only an extended deadline can complete it. The
+        // margins are seconds, not tens of milliseconds, so a loaded runner
+        // does not turn "activity resets the deadline" into a timeout.
         let mut active_cfg = config("codex-cli", &fake);
-        active_cfg.model.timeout_ms = 300;
+        active_cfg.model.timeout_ms = 2_000;
         let scout = CliScout::from_config(&active_cfg).unwrap();
         let started = Instant::now();
         let result = scout
@@ -992,7 +1056,7 @@ done
             })
             .await
             .unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(350));
+        assert!(started.elapsed() >= Duration::from_millis(2_400));
         assert_eq!(result.citations[0].path, "source.rs");
         assert_eq!(result.stats.turns, 2);
         assert_eq!(result.stats.tool_calls, 1);
@@ -1008,14 +1072,19 @@ done
             std::env::var("CODEX_HOME").unwrap_or_default()
         );
 
+        // A silent provider must lose its whole tree, not just the direct
+        // child. The descendant publishes its PID before the idle limit can
+        // expire, so the check below is about the kill, not about the order
+        // two timers happened to fire in.
+        let silent_pid_path = dir.path().join("silent-descendant-pid");
         std::fs::write(
             &fake,
-            "#!/bin/sh\n(sleep 0.5; touch descendant-survived) &\nsleep 5\n",
+            descendant_probe_script(&silent_pid_path, "sleep 120"),
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut timeout_cfg = config("codex-cli", &fake);
-        timeout_cfg.model.timeout_ms = 50;
+        timeout_cfg.model.timeout_ms = 1_000;
         let scout = CliScout::from_config(&timeout_cfg).unwrap();
         let started = Instant::now();
         let error = scout
@@ -1030,15 +1099,17 @@ done
             .await
             .unwrap_err();
         assert!(error.to_string().contains("produced no output"));
-        assert!(started.elapsed() < Duration::from_secs(2));
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        assert!(!dir.path().join("descendant-survived").exists());
-
-        std::fs::write(
-            &fake,
-            "#!/bin/sh\n(sleep 0.5; touch descendant-after-exit) >/dev/null 2>&1 &\nexit 1\n",
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_descendant_dies(
+            descendant_pid(&silent_pid_path).await,
+            "a silent provider left a descendant alive",
         )
-        .unwrap();
+        .await;
+
+        // Same requirement when the provider exits on its own and orphans a
+        // descendant into its process group.
+        let exited_pid_path = dir.path().join("exited-descendant-pid");
+        std::fs::write(&fake, descendant_probe_script(&exited_pid_path, "exit 1")).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let scout = CliScout::from_config(&timeout_cfg).unwrap();
         assert!(scout
@@ -1052,8 +1123,11 @@ done
             })
             .await
             .is_err());
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        assert!(!dir.path().join("descendant-after-exit").exists());
+        assert_descendant_dies(
+            descendant_pid(&exited_pid_path).await,
+            "a provider that exited left a descendant alive",
+        )
+        .await;
     }
 
     #[cfg(unix)]
@@ -1063,15 +1137,16 @@ done
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("source.rs"), "fn main() {}\n").unwrap();
-        let entered = dir.path().join("cancel-entered");
-        let descendant = dir.path().join("cancel-descendant");
+        let pid_path = dir.path().join("cancel-descendant-pid");
         let fake = dir.path().join("fake-codex");
+        // The descendant records its PID up front and then sleeps for far
+        // longer than the test can run, so "was it killed?" is answered by
+        // process state rather than by whether a timer won a race.
         std::fs::write(
             &fake,
             format!(
                 r##"#!/bin/sh
-entered='{}'
-descendant='{}'
+pid_path='{}'
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$line" in
@@ -1079,22 +1154,22 @@ while IFS= read -r line; do
     *'"method":"thread/start"'*) printf '{{"id":%s,"result":{{"thread":{{"id":"thread-1"}}}}}}\n' "$id" ;;
     *'"method":"turn/start"'*)
       printf '{{"id":%s,"result":{{}}}}\n' "$id"
-      : > "$entered"
-      (sleep 0.5; : > "$descendant") &
-      sleep 5
+      sleep 120 &
+      echo $! > "$pid_path.tmp"
+      mv "$pid_path.tmp" "$pid_path"
+      sleep 120
       ;;
   esac
 done
 "##,
-                entered.display(),
-                descendant.display()
+                pid_path.display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cfg = config("codex-cli", &fake);
-        cfg.model.timeout_ms = 5_000;
+        cfg.model.timeout_ms = 30_000;
         let scout = CliScout::from_config(&cfg).unwrap();
         let request = ScoutRequest {
             investigation: Default::default(),
@@ -1105,20 +1180,16 @@ done
             timeout: None,
         };
         let task = tokio::spawn(async move { scout.scout(request).await });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !entered.exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("fake provider did not enter the turn");
+        // Waiting for the PID file guarantees the descendant exists before the
+        // cancellation, so a passing run cannot be a run that cancelled too
+        // early for there to be anything to leak.
+        let pid = descendant_pid(&pid_path).await;
+        assert!(
+            descendant_is_alive(pid),
+            "fake provider recorded a descendant that was never running"
+        );
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(
-            !descendant.exists(),
-            "a cancelled native request left a descendant alive"
-        );
+        assert_descendant_dies(pid, "a cancelled native request left a descendant alive").await;
     }
 }

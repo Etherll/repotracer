@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.0 release candidate
+## 2.0.0
 
 ### Added
 

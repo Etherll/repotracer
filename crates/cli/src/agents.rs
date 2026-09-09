@@ -74,12 +74,23 @@ fn detect_codex() -> AgentInfo {
 }
 
 fn file_contains_repotracer(path: &Path) -> bool {
-    fs::read_to_string(path)
-        .map(|text| {
-            text.lines()
-                .any(|line| line.trim() == "[mcp_servers.repotracer]")
-        })
-        .unwrap_or(false)
+    // Look the key up in the parsed document instead of matching a header line.
+    // `configure_mcp_server` also writes the server as an inline entry when the
+    // user keeps `mcp_servers` inline, and that form never emits a
+    // `[mcp_servers.repotracer]` header. Detection has to mirror the writer or a
+    // successful install reports `configured: false`.
+    // This runs on a user-controlled file, so an unreadable or malformed config
+    // is simply "not configured" rather than an error.
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(document) = parse_codex_config(&text) else {
+        return false;
+    };
+    document
+        .get("mcp_servers")
+        .and_then(|servers| servers.get(REPOTRACER_SERVER_NAME))
+        .is_some()
 }
 
 fn codex_home() -> Option<PathBuf> {
@@ -617,11 +628,13 @@ fn ensure_parent(path: &Path) -> anyhow::Result<()> {
 }
 
 fn backup_file(path: &Path) -> anyhow::Result<()> {
-    if path.exists() {
-        fs::copy(
-            path,
-            PathBuf::from(format!("{}.bak", path.to_string_lossy())),
-        )?;
+    // Never clobber an existing backup. `selfupdate` re-runs the install path
+    // through `__refresh-integration` after every auto-update, so overwriting
+    // would replace the user's pre-RepoTracer snapshot with our own output and
+    // lose the pristine copy for good. The first backup is the one worth keeping.
+    let backup = PathBuf::from(format!("{}.bak", path.to_string_lossy()));
+    if path.exists() && !backup.exists() {
+        fs::copy(path, backup)?;
     }
     Ok(())
 }
@@ -666,6 +679,57 @@ value = 1
         fs::write(&path, remove_codex_entries(installed).unwrap()).unwrap();
 
         assert!(!file_contains_repotracer(&path));
+    }
+
+    #[test]
+    fn detection_matches_every_form_the_installer_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for configured in [
+            "[mcp_servers.repotracer]\ncommand = \"repotracer\"\n",
+            "[mcp_servers]\nrepotracer = { command = \"repotracer\" }\n",
+            "mcp_servers = { repotracer = { command = \"repotracer\" } }\n",
+        ] {
+            fs::write(&path, configured).unwrap();
+            assert!(file_contains_repotracer(&path), "config: {configured}");
+        }
+        for unconfigured in [
+            "[mcp_servers]\nother = { command = \"keep\" }\n",
+            "mcp_servers = { other = { command = \"keep\" } }\n",
+            "model = \"gpt\"\n",
+        ] {
+            fs::write(&path, unconfigured).unwrap();
+            assert!(!file_contains_repotracer(&path), "config: {unconfigured}");
+        }
+    }
+
+    #[test]
+    fn detection_is_infallible_for_unreadable_or_malformed_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(!file_contains_repotracer(&path));
+        fs::write(&path, "[mcp_servers.repotracer\ncommand = \"repotracer\"\n").unwrap();
+        assert!(!file_contains_repotracer(&path));
+    }
+
+    #[test]
+    fn backup_keeps_the_pre_repotracer_snapshot_across_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let backup = dir.path().join("config.toml.bak");
+
+        // Nothing to snapshot before the user has a config.
+        backup_file(&path).unwrap();
+        assert!(!backup.exists());
+
+        fs::write(&path, "pristine").unwrap();
+        backup_file(&path).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "pristine");
+
+        // A later auto-update refresh must not overwrite the first snapshot.
+        fs::write(&path, "installed").unwrap();
+        backup_file(&path).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "pristine");
     }
 
     #[test]
