@@ -125,10 +125,6 @@ pub fn run(
         && codex_model.is_none()
         && claude_model.is_none();
     let mut targets = targets;
-    let codex = codex;
-    let claude = claude;
-    let codex_model = codex_model;
-    let claude_model = claude_model;
     let interactive =
         no_options && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let mut edited_parents: Option<Vec<String>> = None;

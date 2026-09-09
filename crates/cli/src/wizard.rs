@@ -72,17 +72,7 @@ struct App {
     custom_field: usize,
     custom_key_touched: bool,
     custom_loading: bool,
-    custom_receiver: Option<
-        mpsc::Receiver<
-            Result<
-                (
-                    Vec<ModelChoice>,
-                    std::collections::BTreeMap<String, Vec<String>>,
-                ),
-                String,
-            >,
-        >,
-    >,
+    custom_receiver: Option<mpsc::Receiver<Result<model_catalog::DiscoveredModels, String>>>,
     picker: ListState,
     message: String,
     no_color: bool,
@@ -95,6 +85,7 @@ enum Outcome {
 }
 
 impl App {
+    #[cfg(test)]
     fn new(installed: &[String], current: &[(String, Option<ModelChoice>)]) -> Self {
         let profiles = current
             .iter()
@@ -758,7 +749,7 @@ impl App {
             let rows = self
                 .effort_candidates()
                 .into_iter()
-                .map(|level| ListItem::new(level))
+                .map(ListItem::new)
                 .collect::<Vec<_>>();
             let effort_body =
                 Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(body[1]);
@@ -878,22 +869,6 @@ impl Drop for TerminalSession {
         let _ = disable_raw_mode();
         let _ = execute!(io::stderr(), LeaveAlternateScreen, crossterm::cursor::Show);
     }
-}
-
-pub fn configure(
-    installed: &[String],
-    current: &[(String, Option<ModelChoice>)],
-) -> io::Result<Option<ModelSelection>> {
-    let profiles = current
-        .iter()
-        .map(|(parent, choice)| CurrentProfile {
-            parent: parent.clone(),
-            choice: choice.clone(),
-            custom: None,
-            reasoning_effort: None,
-        })
-        .collect::<Vec<_>>();
-    configure_with_profiles(installed, &profiles)
 }
 
 pub fn configure_with_profiles(

@@ -78,9 +78,9 @@ pub async fn discover_openai_models(
 /// Parse the OpenAI model-list envelope without retaining any provider secret.
 /// Kept separate from transport so malformed/partial provider responses are
 /// covered without a live endpoint.
-pub fn parse_openai_models(
-    payload: &Value,
-) -> Result<(Vec<ModelChoice>, BTreeMap<String, Vec<String>>)> {
+pub type DiscoveredModels = (Vec<ModelChoice>, BTreeMap<String, Vec<String>>);
+
+pub fn parse_openai_models(payload: &Value) -> Result<DiscoveredModels> {
     let entries = payload
         .get("data")
         .or_else(|| payload.get("models"))

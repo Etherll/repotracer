@@ -192,17 +192,6 @@ fn from_openai_message(m: OpenAiMessage) -> Result<ChatMessage, ModelError> {
     })
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        return s.to_string();
-    }
-    let mut end = n;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
-}
-
 fn safe_endpoint(value: &str) -> String {
     let Ok(mut url) = reqwest::Url::parse(value) else {
         return "configured endpoint".into();
@@ -323,14 +312,9 @@ impl From<OpenAiUsage> for Usage {
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate, OpenAiUsage};
+    use super::OpenAiUsage;
     use crate::types::Usage;
     use serde_json::json;
-
-    #[test]
-    fn truncates_at_utf8_boundary() {
-        assert_eq!(truncate("1234567é", 8), "1234567…");
-    }
 
     #[test]
     fn parses_cache_and_reasoning_subsets_without_filling_missing_fields() {
