@@ -88,10 +88,13 @@ pub(crate) fn select_repository(
     if let Some(remembered) = remembered {
         return directory(remembered.to_owned());
     }
+    let original_default = default;
     let default = directory(default.to_owned())?;
     if let Some(focus) = focus.filter(|path| path.is_absolute()) {
         // Do not turn an in-root symlink escape into permission to change roots.
-        if !focus.starts_with(&default) {
+        if !focus.starts_with(&default)
+            && !(original_default.is_absolute() && focus.starts_with(original_default))
+        {
             let resolved = focus
                 .canonicalize()
                 .context("absolute focus does not exist; set repository explicitly")?;
@@ -254,6 +257,27 @@ mod tests {
             base.path().canonicalize().unwrap()
         );
         // Core normalize_paths subsequently rejects this escaping focus.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliased_root_keeps_symlink_escape_in_original_repository() {
+        let base = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let aliases = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(other.path())
+            .status()
+            .unwrap()
+            .success());
+        let alias = aliases.path().join("root");
+        std::os::unix::fs::symlink(base.path(), &alias).unwrap();
+        std::os::unix::fs::symlink(other.path(), base.path().join("escape")).unwrap();
+        assert_eq!(
+            select_repository(&alias, None, Some(&alias.join("escape")), None).unwrap(),
+            base.path().canonicalize().unwrap()
+        );
     }
 
     #[tokio::test]
