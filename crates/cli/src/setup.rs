@@ -114,6 +114,9 @@ fn gpt_config(cfg: &RepoTracerConfig) -> Result<RepoTracerConfig> {
             selected.model.api_key = None;
         }
     }
+    if crate::subscription::is_subscription_backend(&selected) {
+        selected.model.reasoning_effort = selected.model.native_reasoning_effort().to_string();
+    }
     Ok(selected)
 }
 

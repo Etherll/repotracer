@@ -181,6 +181,9 @@ async fn run(cli: Cli) -> Result<()> {
         cfg.model.model = m.clone();
     }
     if let Some(u) = &cli.base_url {
+        if cfg.model.is_claude() || subscription::is_subscription_backend(&cfg) {
+            cfg.model.reasoning_effort.clear();
+        }
         cfg.model.base_url = u.clone();
         cfg.model.backend = "openai-compatible".into();
     }
@@ -512,7 +515,7 @@ fn build_scout(
                 backend,
                 enabled,
                 enabled.then(|| native_supported_efforts(cfg)).flatten(),
-                cfg.model.reasoning_effort.clone(),
+                cfg.model.native_reasoning_effort().to_string(),
             )
             .with_turn_ceiling(cfg.explorer.max_turns),
         ));
@@ -525,7 +528,7 @@ fn build_scout(
                 backend,
                 enabled,
                 enabled.then(|| native_supported_efforts(cfg)).flatten(),
-                cfg.model.reasoning_effort.clone(),
+                cfg.model.native_reasoning_effort().to_string(),
             )
             .with_turn_ceiling(cfg.explorer.max_turns),
         ));

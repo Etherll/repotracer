@@ -40,12 +40,16 @@ pub fn profile(base: &Path, parent: &str) -> PathBuf {
 
 fn select_provider(cfg: &mut RepoTracerConfig, provider: &str) {
     if matches!(provider, "openai" | "openai-compatible") {
+        if cfg.model.is_claude() || crate::subscription::is_subscription_backend(cfg) {
+            cfg.model.reasoning_effort.clear();
+        }
         cfg.model.backend = "openai-compatible".into();
         cfg.model.executable = None;
         return;
     }
     let changed = cfg.model.backend != format!("{provider}-cli");
     cfg.model.backend = format!("{provider}-cli");
+    cfg.model.reasoning_effort = cfg.model.native_reasoning_effort().to_string();
     cfg.model.model = if provider == "claude" {
         "sonnet"
     } else {
@@ -473,6 +477,22 @@ mod tests {
         assert_eq!(cfg.session.max_thread_turns, 7);
         select_provider(&mut cfg, "claude");
         assert_eq!(cfg.model.executable, None);
+    }
+
+    #[test]
+    fn switching_to_an_api_does_not_carry_native_effort() {
+        let mut cfg = RepoTracerConfig::default();
+        select_provider(&mut cfg, "claude");
+        assert_eq!(cfg.model.reasoning_effort, "medium");
+        cfg.model.reasoning_effort = "high".into();
+        select_provider(&mut cfg, "openai-compatible");
+        assert!(cfg.model.reasoning_effort.is_empty());
+        cfg.model.reasoning_effort = "low".into();
+        select_provider(&mut cfg, "openai-compatible");
+        assert_eq!(cfg.model.reasoning_effort, "low");
+        cfg.model.reasoning_effort.clear();
+        select_provider(&mut cfg, "codex");
+        assert_eq!(cfg.model.reasoning_effort, "medium");
     }
 
     #[test]

@@ -49,7 +49,7 @@ impl CliScout {
             model if !model.chars().any(char::is_control) => Some(model.to_string()),
             _ => bail!("model identifier must not contain control characters"),
         };
-        let reasoning_effort = match cfg.model.reasoning_effort.trim() {
+        let reasoning_effort = match cfg.model.native_reasoning_effort() {
             effort @ ("low" | "medium" | "high" | "xhigh" | "max") => effort.to_string(),
             effort => bail!(
                 "unsupported scout reasoning effort `{effort}`; use low, medium, high, xhigh, or max"

@@ -272,7 +272,7 @@ impl ClaudeScout {
             bail!("Claude scout uses Claude Code subscription login, not an API key");
         }
         let mut cfg = cfg.clone();
-        let configured_effort = cfg.model.reasoning_effort.trim().to_string();
+        let configured_effort = cfg.model.native_reasoning_effort().to_string();
         if !matches!(
             configured_effort.as_str(),
             "low" | "medium" | "high" | "xhigh" | "max"

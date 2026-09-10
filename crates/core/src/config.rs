@@ -68,7 +68,8 @@ pub struct ModelSettings {
     pub executable: Option<String>,
     #[serde(default = "default_model")]
     pub model: String,
-    #[serde(default = "default_reasoning_effort")]
+    /// Optional API reasoning effort. Native providers use medium when empty.
+    #[serde(default)]
     pub reasoning_effort: String,
     /// Permit one scout-requested continuation at a higher native-supported effort.
     #[serde(default = "default_true")]
@@ -88,6 +89,13 @@ pub struct ModelSettings {
 }
 
 impl ModelSettings {
+    pub fn native_reasoning_effort(&self) -> &str {
+        match self.reasoning_effort.trim() {
+            "" => "medium",
+            effort => effort,
+        }
+    }
+
     /// Whether this profile selects the native Claude Code backend.
     pub fn is_claude(&self) -> bool {
         matches!(
@@ -109,9 +117,6 @@ fn default_backend() -> String {
 fn default_model() -> String {
     "gpt-5.6-luna".into()
 }
-fn default_reasoning_effort() -> String {
-    "medium".into()
-}
 fn default_service_tier() -> String {
     "fast".into()
 }
@@ -125,7 +130,7 @@ impl Default for ModelSettings {
             backend: default_backend(),
             executable: None,
             model: default_model(),
-            reasoning_effort: default_reasoning_effort(),
+            reasoning_effort: String::new(),
             adaptive_reasoning: true,
             service_tier: default_service_tier(),
             base_url: default_base_url(),
@@ -280,6 +285,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reasoning_defaults_belong_to_native_providers() {
+        for model in [
+            ModelSettings::default(),
+            toml::from_str::<ModelSettings>("").unwrap(),
+            toml::from_str::<ModelSettings>("backend = 'openai-compatible'").unwrap(),
+        ] {
+            assert!(model.reasoning_effort.is_empty());
+            assert_eq!(model.native_reasoning_effort(), "medium");
+            let saved: ModelSettings = toml::from_str(&toml::to_string(&model).unwrap()).unwrap();
+            assert!(saved.reasoning_effort.is_empty());
+        }
+        let explicit: ModelSettings = toml::from_str("reasoning_effort = 'high'").unwrap();
+        assert_eq!(explicit.reasoning_effort, "high");
+        assert_eq!(explicit.native_reasoning_effort(), "high");
+    }
+
+    #[test]
     fn saving_a_profile_does_not_mutate_existing_readers() {
         use std::io::Read;
         let dir = tempfile::tempdir().unwrap();
@@ -326,7 +348,7 @@ mod tests {
         let off: RepoTracerConfig =
             toml::from_str("[model]\nadaptive_reasoning = false\n").unwrap();
         assert!(!off.model.adaptive_reasoning);
-        assert_eq!(off.model.reasoning_effort, "medium");
+        assert_eq!(off.model.native_reasoning_effort(), "medium");
         let round_trip: RepoTracerConfig = toml::from_str(&toml::to_string(&off).unwrap()).unwrap();
         assert!(!round_trip.model.adaptive_reasoning);
     }
