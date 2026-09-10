@@ -52,7 +52,7 @@ impl RepoTracerConfig {
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
         file.write_all(text.as_bytes())?;
         file.as_file().sync_all()?;
-        file.persist(path)?;
+        file.into_temp_path().persist(path)?;
         Ok(())
     }
 }
@@ -286,10 +286,28 @@ mod tests {
         let previous = std::fs::read_to_string(&path).unwrap();
         let mut reader = std::fs::File::open(&path).unwrap();
         config.model.model = "updated-model".into();
-        config.save_to(&path).unwrap();
+        let saved = config.save_to(&path);
+        if let Err(error) = saved {
+            // Windows can refuse replacement while another handle is open.
+            // That must leave the complete previous profile intact.
+            #[cfg(not(windows))]
+            panic!("profile replacement failed: {error}");
+            #[cfg(windows)]
+            {
+                drop(error);
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+            }
+        } else {
+            assert_eq!(
+                RepoTracerConfig::load_from(&path).unwrap().model.model,
+                "updated-model"
+            );
+        }
         let mut original = String::new();
         reader.read_to_string(&mut original).unwrap();
         assert_eq!(original, previous);
+        drop(reader);
+        config.save_to(&path).unwrap();
         assert_eq!(
             RepoTracerConfig::load_from(&path).unwrap().model.model,
             "updated-model"
