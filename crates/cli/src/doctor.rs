@@ -63,7 +63,7 @@ pub async fn run(root: &Path, cfg: &RepoTracerConfig, json_mode: bool) -> Result
     });
 
     // Configured scout backend
-    if matches!(cfg.model.backend.as_str(), "claude" | "claude-cli") {
+    if cfg.model.is_claude() {
         let executable = cfg.model.executable.as_deref().unwrap_or("claude");
         checks.push(
             if crate::claude::ClaudeScout::new(cfg).is_ok() && which::which(executable).is_ok() {

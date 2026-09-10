@@ -41,25 +41,18 @@ impl RepoTracerConfig {
             std::fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self)?;
-        // Profiles may contain a custom endpoint credential. Keep the file
-        // private even when it is created on a permissive umask, and preserve
-        // that mode when updating an existing profile.
+        // Write a private sibling first so readers and failed saves retain the
+        // previous profile until the complete replacement is ready.
         use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        // NamedTempFile uses mode 0600 on Unix and cleans up unsuccessful writes.
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
         file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        file.as_file().sync_all()?;
+        file.persist(path)?;
         Ok(())
     }
 }
@@ -92,6 +85,14 @@ pub struct ModelSettings {
 }
 
 impl ModelSettings {
+    /// Whether this profile selects the native Claude Code backend.
+    pub fn is_claude(&self) -> bool {
+        matches!(
+            self.backend.to_ascii_lowercase().as_str(),
+            "claude" | "claude-cli"
+        )
+    }
+
     pub fn resolved_api_key(&self) -> Option<String> {
         std::env::var("REPOTRACER_API_KEY")
             .ok()
@@ -274,6 +275,27 @@ impl ExplorerBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_a_profile_does_not_mutate_existing_readers() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.toml");
+        let mut config = RepoTracerConfig::default();
+        config.save_to(&path).unwrap();
+        let previous = std::fs::read_to_string(&path).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        config.model.model = "updated-model".into();
+        config.save_to(&path).unwrap();
+        let mut original = String::new();
+        reader.read_to_string(&mut original).unwrap();
+        assert_eq!(original, previous);
+        assert_eq!(
+            RepoTracerConfig::load_from(&path).unwrap().model.model,
+            "updated-model"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn adaptive_reasoning_preserves_initial_effort_and_can_be_disabled() {

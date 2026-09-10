@@ -2,6 +2,7 @@
 name = "repotracer-mcp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "MCP server for repotracer"
 repository.workspace = true

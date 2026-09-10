@@ -25,9 +25,9 @@ Local release-candidate checks currently cover Linux. They include the Rust
 workspace and npm launcher checks used by this repository. The exact commands
 belong to the release pipeline and may change with the candidate.
 
-macOS and Windows CI verification is pending. Until those jobs complete, the
-release candidate should not be described as end-to-end verified on those
-platforms.
+GitHub CI has passed on Linux, macOS, and Windows, including the native Codex
+app-server checks. Live Claude subscription checks remain a separate, opt-in
+local check described in CONTRIBUTING.md.
 
 The defaults describe the configuration shipped by v2; they do not predict an
 outcome. This status page does not make cost, latency, or quality claims.

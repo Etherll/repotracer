@@ -49,8 +49,10 @@ pub async fn discover_openai_models(
     base_url: &str,
     api_key: Option<&str>,
 ) -> Result<(Vec<ModelChoice>, BTreeMap<String, Vec<String>>)> {
+    repotracer_model::validate_api_endpoint(base_url, api_key)?;
     let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
+        .https_only(api_key.is_some_and(|key| !key.trim().is_empty()))
         .timeout(timeout())
         .build()
         .context("build model discovery client")?;
@@ -584,9 +586,12 @@ async fn discover_codex(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command
         .spawn()
         .with_context(|| format!("start `{}`", executable.display()))?;
+    let _process_group = ProbeProcessGroup(child.id());
     let result = discover_codex_child(&mut child).await;
     finish_child(&mut child).await;
     result
@@ -890,9 +895,12 @@ async fn discover_claude_efforts_for(
     for name in CLAUDE_API_ENVIRONMENT {
         command.env_remove(name);
     }
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command
         .spawn()
         .with_context(|| format!("start `{}`", executable.display()))?;
+    let _process_group = ProbeProcessGroup(child.id());
     let mut stderr = StderrTail::drain(child.stderr.take());
     let result = discover_claude_effort_child(&mut child, model).await;
     finish_child(&mut child).await;
@@ -1049,9 +1057,12 @@ async fn discover_claude_for(
     for name in CLAUDE_API_ENVIRONMENT {
         command.env_remove(name);
     }
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command
         .spawn()
         .with_context(|| format!("start `{}`", executable.display()))?;
+    let _process_group = ProbeProcessGroup(child.id());
     let stdout = child
         .stdout
         .take()
@@ -1166,6 +1177,19 @@ async fn finish_child(child: &mut Child) {
     }
 }
 
+/// Own the provider's process group even if discovery is cancelled or the
+/// direct child exits before its helpers. Declared after `Child` so the group
+/// is terminated before Tokio drops and reaps the direct child.
+struct ProbeProcessGroup(Option<u32>);
+
+impl Drop for ProbeProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            crate::session::kill_process_group(pid);
+        }
+    }
+}
+
 async fn kill_and_reap(child: &mut Child) {
     let _ = child.kill().await;
     let _ = child.wait().await;
@@ -1211,6 +1235,95 @@ pub(crate) fn write_executable_fixture(path: &Path, script: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn authenticated_discovery_rejects_http_before_sending_credentials() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}").await.unwrap();
+        });
+        let result =
+            discover_openai_models(&format!("http://{address}/v1"), Some("test-secret")).await;
+        server.abort();
+        assert!(result.is_err(), "HTTP discovery sent the API credential");
+        assert!(result.unwrap_err().to_string().contains("HTTPS"));
+    }
+
+    #[cfg(unix)]
+    async fn assert_probe_descendants_cleaned_up(cancel: bool) {
+        for provider in ["codex", "claude-efforts", "claude-picker"] {
+            let dir = tempfile::tempdir().unwrap();
+            let executable = dir.path().join("provider");
+            let pid_file = dir.path().join("descendant");
+            write_executable_fixture(
+                &executable,
+                &format!(
+                    "#!/bin/sh\nsleep 30 </dev/null >/dev/null 2>&1 &\necho $! > '{}'\n{}\n",
+                    pid_file.display(),
+                    if cancel { "exec sleep 30" } else { "exit 0" }
+                ),
+            );
+            let task = tokio::spawn(async move {
+                match provider {
+                    "codex" => {
+                        let _ = discover_codex(&executable).await;
+                    }
+                    "claude-efforts" => {
+                        let _ = discover_claude_efforts_for(&executable, "sonnet", None).await;
+                    }
+                    _ => {
+                        let _ = discover_claude_for(&executable, None).await;
+                    }
+                }
+            });
+            let pid = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                        if let Ok(pid) = text.trim().parse::<i32>() {
+                            break pid;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if cancel {
+                task.abort();
+            }
+            let _ = task.await;
+            let exited = tokio::time::timeout(Duration::from_secs(1), async {
+                while unsafe { libc::kill(pid, 0) } == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            if !exited {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            assert!(exited, "{provider} leaked a descendant (cancel={cancel})");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_reaps_descendants_after_completion() {
+        assert_probe_descendants_cleaned_up(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_reaps_descendants_after_cancellation() {
+        assert_probe_descendants_cleaned_up(true).await;
+    }
 
     #[test]
     fn codex_catalog_filters_hidden_entries_and_uses_display_name() {

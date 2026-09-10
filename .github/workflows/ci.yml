@@ -38,6 +38,15 @@ concurrency:
 
 jobs:
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check minimum supported Rust version
+        run: cargo check --workspace --all-targets --locked
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:

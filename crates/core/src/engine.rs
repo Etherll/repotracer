@@ -334,7 +334,7 @@ impl ScoutEngine {
             let (summary, validated, investigation) = assess_output(&request, &content);
 
             // One correction turn if claimed citations are invalid or malformed.
-            if validated.is_empty() && !correction_used && content.contains("<final_answer>") {
+            if validated.is_empty() && !correction_used && !content.trim().is_empty() {
                 correction_used = true;
                 messages.push(ChatMessage::user(
                     "The cited locations were invalid. Return investigation JSON with direct source evidence. Mark unresolved questions partial instead of inventing citations.",
@@ -509,6 +509,47 @@ mod tests {
             completion_tokens: Some(input / 4),
             reasoning_output_tokens: Some(input / 8),
             total_tokens: Some(input + input / 4),
+        }
+    }
+
+    #[tokio::test]
+    async fn json_reports_with_invalid_citations_get_one_correction() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn answer() {}\n").unwrap();
+        let report = |path: &str| {
+            serde_json::json!({
+            "answer": "The answer function is defined in lib.rs.",
+            "status": "complete",
+            "findings": [{"question": "find answer", "answer": "Function definition",
+                "citations": [{"path": path, "start_line": 1, "end_line": 1, "reason": "definition"}]}],
+            "unresolved": [], "searched_scope": ["lib.rs"], "limitations": []
+        }).to_string()
+        };
+        for corrected_path in ["lib.rs", "still-missing.rs"] {
+            let model = Arc::new(MockModel::new(MockScript {
+                steps: vec![
+                    MockStep::Final(report("missing.rs")),
+                    MockStep::Final(report(corrected_path)),
+                ],
+            }));
+            let engine =
+                ScoutEngine::new(model, RepoTools::new(dir.path()), ExplorerBudget::default());
+            let result = engine
+                .scout(ScoutRequest {
+                    investigation: Default::default(),
+                    query: "find answer".into(),
+                    root: dir.path().to_owned(),
+                    focus: None,
+                    max_turns: Some(4),
+                    timeout: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(result.stats.turns, 2);
+            assert_eq!(
+                result.citations.len(),
+                usize::from(corrected_path == "lib.rs")
+            );
         }
     }
 

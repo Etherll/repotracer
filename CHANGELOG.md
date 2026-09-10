@@ -27,8 +27,8 @@
 
 ### Verification status
 
-The release candidate has local Linux verification. macOS and Windows CI
-verification is pending. This release note makes no savings, latency, or
+The release candidate has passed GitHub CI on Linux, macOS, and Windows,
+including the native Codex app-server checks. This release note makes no savings, latency, or
 quality claim.
 
 ## 1.0.1 — 2026-08-30

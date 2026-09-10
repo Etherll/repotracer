@@ -34,8 +34,24 @@ function findBinary() {
   return candidates.find(candidate => fs.existsSync(candidate)) || null;
 }
 
+function topLevelCommand(args) {
+  const valuedOptions = new Set(['--root', '--config', '--model', '--base-url']);
+  const flags = new Set(['--json', '--mock', '--verbose', '-v']);
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (valuedOptions.has(arg)) {
+      index += 1;
+    } else if (valuedOptions.has(arg.split('=')[0]) || flags.has(arg)) {
+      continue;
+    } else {
+      return arg.startsWith('-') ? null : arg;
+    }
+  }
+  return null;
+}
+
 function persistForSetup(bin, args, home = os.homedir()) {
-  if (!path.isAbsolute(bin) || !args.some(arg => ['setup', 'settings', 'reconfigure'].includes(arg)) || args.includes('--dry-run')) return bin;
+  if (!path.isAbsolute(bin) || !['setup', 'settings', 'reconfigure'].includes(topLevelCommand(args)) || args.includes('--dry-run')) return bin;
 
   const name = process.platform === 'win32' ? 'repotracer.exe' : 'repotracer';
   const directory = path.join(home, '.repotracer', 'bin');

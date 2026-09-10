@@ -37,19 +37,21 @@ agent after setup.
 ## Settings
 
 ```bash
-repotracer settings
+npx repotracer@latest settings
 ```
 
 The TUI uses two steps. First choose the parent integrations. Then accept
 recommended models or keep saved choices. Open `Advanced` to search and
 review a different provider/model for each parent. The
-custom format is `codex:model-id` or `claude:model-id`. Esc and Ctrl-C cancel,
-and nothing is written before the final save.
+Custom API form accepts a base URL, model ID, and optional API key. Keys
+require HTTPS; unauthenticated local endpoints can use HTTP. Use the flags
+below for native model IDs. Esc and Ctrl-C cancel, and nothing is written
+before the final save.
 
 For automation, use explicit settings flags:
 
 ```bash
-repotracer settings --agents both \
+npx repotracer@latest settings --agents both \
   --codex-scout codex --codex-model gpt-5.6-luna \
   --claude-scout claude --claude-model sonnet
 ```
@@ -59,14 +61,14 @@ Use `--dry-run` to preview changes. Parent profiles are independent.
 ## Commands
 
 ```bash
-repotracer "where is authentication handled?"
-repotracer scout "trace token refresh" --intent diagnose
-repotracer symbols "Config" --mode references
-repotracer serve
-repotracer doctor
-repotracer status
-repotracer update
-repotracer uninstall --yes
+npx repotracer@latest "where is authentication handled?"
+npx repotracer@latest scout "trace token refresh" --intent diagnose
+npx repotracer@latest symbols "Config" --mode references
+npx repotracer@latest serve
+npx repotracer@latest doctor
+npx repotracer@latest status
+npx repotracer@latest update
+npx repotracer@latest uninstall --yes
 ```
 
 `serve` runs the MCP server over stdio. `symbols` performs a local syntax
@@ -88,8 +90,7 @@ OpenAI-compatible engine, not the native scouts. Both default to zero.
 
 Node.js 18 or newer is required for the launcher. Published native packages
 target macOS arm64 and x64, Linux arm64 and x64, and Windows x64. The v2
-release candidate has local Linux verification; macOS and Windows CI checks
-are pending.
+release candidate has passed GitHub CI on Linux, macOS, and Windows.
 
 RepoTracer does not promise lower cost, faster completion, or a particular
 answer quality. Provider and parent-agent behavior affect each result.

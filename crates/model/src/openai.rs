@@ -12,9 +12,30 @@ pub struct OpenAiCompatBackend {
     config: ModelConfig,
 }
 
+/// Require encrypted transport when a custom endpoint receives an API key.
+/// HTTP remains available for unauthenticated local model servers.
+pub fn validate_api_endpoint(base_url: &str, api_key: Option<&str>) -> Result<(), ModelError> {
+    if api_key.is_some_and(|key| !key.trim().is_empty()) {
+        let url = reqwest::Url::parse(base_url)
+            .map_err(|_| ModelError::Request("invalid model endpoint URL".into()))?;
+        if url.scheme() != "https" {
+            return Err(ModelError::Request(
+                "an API key requires an HTTPS endpoint".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl OpenAiCompatBackend {
     pub fn new(config: ModelConfig) -> Result<Self, ModelError> {
-        let mut builder = reqwest::Client::builder();
+        validate_api_endpoint(&config.base_url, config.api_key.as_deref())?;
+        let mut builder = reqwest::Client::builder().https_only(
+            config
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()),
+        );
         if config.timeout_ms > 0 {
             builder = builder.timeout(Duration::from_millis(config.timeout_ms));
         }
@@ -77,7 +98,12 @@ impl ModelBackend for OpenAiCompatBackend {
         }
 
         let mut req = self.client.post(&url).json(&body);
-        if let Some(key) = &self.config.api_key {
+        if let Some(key) = self
+            .config
+            .api_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+        {
             req = req.bearer_auth(key);
         }
 
@@ -346,6 +372,28 @@ mod tests {
         assert_eq!(parsed.completion_tokens, None);
         assert_eq!(parsed.total_tokens, None);
         assert_eq!(parsed.cached_prompt_tokens, None);
+    }
+
+    #[test]
+    fn authenticated_completions_require_https_but_local_http_still_works() {
+        for (base_url, api_key, accepted) in [
+            ("http://127.0.0.1:8080/v1", None, true),
+            ("http://127.0.0.1:8080/v1", Some(""), true),
+            ("http://example.com/v1", Some("test-key"), false),
+            ("https://example.com/v1", Some("test-key"), true),
+            ("HTTPS://example.com/v1", Some("test-key"), true),
+        ] {
+            let config = super::ModelConfig {
+                base_url: base_url.into(),
+                api_key: api_key.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(
+                super::OpenAiCompatBackend::new(config).is_ok(),
+                accepted,
+                "{base_url}"
+            );
+        }
     }
 
     #[test]

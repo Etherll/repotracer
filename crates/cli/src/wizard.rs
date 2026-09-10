@@ -473,19 +473,6 @@ impl App {
                     self.custom_field += 1;
                 }
                 KeyCode::Enter => {
-                    // Keep accepting the old provider:model escape hatch for
-                    // scripts and muscle memory. It remains a native choice;
-                    // the form below is the custom HTTP path.
-                    if let Ok((provider, id)) = crate::settings::parse_tracer_model(&self.query) {
-                        self.choose_model(ModelChoice {
-                            provider: provider.into(),
-                            id: id.into(),
-                            label: "Custom".into(),
-                        });
-                        self.query.clear();
-                        self.page = Page::Models;
-                        return Outcome::Continue;
-                    }
                     let base_url = self.custom_fields[0].trim();
                     let model = self.custom_fields[1].trim();
                     if base_url.is_empty() || !base_url.starts_with("http") {
@@ -787,7 +774,9 @@ impl App {
                 .into_iter()
                 .rev()
                 .collect();
-            let search = if compact {
+            let search = if self.page == Page::Custom {
+                label.to_owned()
+            } else if compact {
                 format!("/ {input}_")
             } else {
                 format!("{label}\n{input}_")
@@ -991,6 +980,17 @@ mod tests {
         };
         assert_eq!(selection.0[0].model.id, "gpt-5.6-luna");
         assert_eq!(selection.0[1].model.id, "sonnet");
+    }
+
+    #[test]
+    fn custom_form_only_shows_editable_inputs() {
+        let mut app = app();
+        app.open_picker(0);
+        app.open_custom();
+        assert!(!screen(&mut app, 80, 24).contains('_'));
+        app.custom_fields[0].clear();
+        type_text(&mut app, "http://localhost:8080/v1");
+        assert!(screen(&mut app, 80, 24).contains("http://localhost:8080/v1"));
     }
 
     #[test]

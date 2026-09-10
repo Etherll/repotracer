@@ -92,8 +92,8 @@ pub(crate) fn select_repository(
     let default = directory(default.to_owned())?;
     if let Some(focus) = focus.filter(|path| path.is_absolute()) {
         // Do not turn an in-root symlink escape into permission to change roots.
-        if !focus.starts_with(&default)
-            && !(original_default.is_absolute() && focus.starts_with(original_default))
+        if !(focus.starts_with(&default)
+            || original_default.is_absolute() && focus.starts_with(original_default))
         {
             let resolved = focus
                 .canonicalize()

@@ -465,7 +465,9 @@ fn cmd_status(
 
 pub(crate) fn redact_endpoint(value: &str) -> String {
     let Ok(mut url) = reqwest::Url::parse(value) else {
-        return value.to_owned();
+        // Invalid input can still contain userinfo, query tokens, or fragments.
+        // Do not guess which parts of an unparseable URL are safe to print.
+        return "<invalid endpoint>".into();
     };
     if url.query().is_some() {
         url.set_query(None);
@@ -502,7 +504,7 @@ fn build_scout(
     cfg: &RepoTracerConfig,
     mock: bool,
 ) -> Result<Arc<dyn ScoutBackend>> {
-    if !mock && matches!(cfg.model.backend.as_str(), "claude" | "claude-cli") {
+    if !mock && cfg.model.is_claude() {
         let backend: Arc<dyn ScoutBackend> = Arc::new(claude::ClaudeScout::new(cfg)?);
         let enabled = adaptive_enabled(cfg);
         return Ok(Arc::new(
@@ -592,4 +594,35 @@ fn init_tracing(verbose: bool) {
         .with_writer(std::io::stderr)
         .with_target(false)
         .try_init();
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    #[test]
+    fn mixed_case_claude_backends_use_native_validation() {
+        for backend in ["Claude", "CLAUDE-CLI"] {
+            let mut config = repotracer_core::RepoTracerConfig::default();
+            config.model.backend = backend.into();
+            config.model.model = "sonnet".into();
+            config.model.adaptive_reasoning = false;
+            assert!(super::claude::ClaudeScout::new(&config).is_ok());
+            config.model.reasoning_effort = "invalid".into();
+            assert!(super::build_scout(std::path::Path::new("."), &config, false).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_endpoints_do_not_expose_credentials() {
+        for endpoint in [
+            "localhost/v1?key=secret#secret",
+            "https://user:secret@bad host/v1?token=secret#secret",
+            "https://user:secret@example.com/v1?token=secret#secret",
+        ] {
+            assert!(!super::redact_endpoint(endpoint).contains("secret"));
+            let mut config = repotracer_core::RepoTracerConfig::default();
+            config.model.base_url = endpoint.into();
+            config.model.api_key = Some("secret".into());
+            assert!(!super::redacted_toml(&config).unwrap().contains("secret"));
+        }
+    }
 }

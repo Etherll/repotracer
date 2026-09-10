@@ -1517,13 +1517,10 @@ async fn kill_process_tree(child: &mut Child, process_group: Option<u32>) {
 
 #[cfg(unix)]
 pub(crate) fn kill_process_group(process_group: u32) {
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
     // The child starts a new process group, so a negative PID targets it and
     // its descendants. A stale group simply returns ESRCH.
     unsafe {
-        let _ = kill(-(process_group as i32), 9);
+        let _ = libc::kill(-(process_group as i32), libc::SIGKILL);
     }
 }
 

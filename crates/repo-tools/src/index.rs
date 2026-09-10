@@ -110,7 +110,12 @@ impl RepositoryIndex {
         &self,
         arguments: &str,
     ) -> Result<(String, u64, u64, bool, u64, u64), ToolError> {
-        let args: IndexArgs = serde_json::from_str(arguments)?;
+        let args: IndexArgs = serde_json::from_str(if arguments.trim().is_empty() {
+            "{}"
+        } else {
+            arguments
+        })
+        .map_err(|error| ToolError::InvalidArgs(error.to_string()))?;
         if !["definitions", "references", "outline"].contains(&args.mode.as_str()) {
             return Err(ToolError::InvalidArgs("unknown Symbols mode".into()));
         }
@@ -435,6 +440,22 @@ fn configuration(language: &str) -> Result<TagsConfiguration, ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn empty_arguments_list_symbols_and_bad_json_is_invalid_args() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "fn answer() {}\n").unwrap();
+        let index = RepositoryIndex::new(root.path());
+        for args in ["", "   ", "{}"] {
+            let result: serde_json::Value =
+                serde_json::from_str(&index.call(args).await.unwrap()).unwrap();
+            assert_eq!(result["items"][0]["name"], "answer");
+        }
+        assert!(matches!(
+            index.call("{").await,
+            Err(ToolError::InvalidArgs(_))
+        ));
+    }
     #[tokio::test]
     async fn five_languages_and_changed_deleted_files() {
         let root = tempfile::tempdir().unwrap();

@@ -367,10 +367,7 @@ fn empty_turn_stats(duration_ms: u64, model: &str, reasoning_effort: &str) -> Sc
         duration_ms,
         model: model.into(),
         reasoning_effort: Some(reasoning_effort.to_string()),
-        index_usage: Some(repotracer_core::IndexUsage {
-            available: true,
-            ..Default::default()
-        }),
+        index_usage: None,
         ..Default::default()
     }
 }

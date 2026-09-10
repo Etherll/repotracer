@@ -164,7 +164,7 @@ impl ScoutBackend for AdaptiveScout {
             .unwrap_or(&self.current_effort);
         first_request.investigation.continuation_efforts = Some(
             if self.enabled
-                && !request.max_turns.is_some_and(|turns| turns > 0)
+                && request.max_turns.is_none_or(|turns| turns == 0)
                 && self.turn_ceiling.is_none()
             {
                 self.supported_efforts

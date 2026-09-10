@@ -262,7 +262,7 @@ pub struct ClaudeScout {
 
 impl ClaudeScout {
     pub fn new(cfg: &RepoTracerConfig) -> Result<Self> {
-        if !matches!(cfg.model.backend.as_str(), "claude" | "claude-cli") {
+        if !cfg.model.is_claude() {
             bail!("not a Claude backend");
         }
         if cfg.model.model.starts_with("gpt-") || cfg.model.model.trim().is_empty() {

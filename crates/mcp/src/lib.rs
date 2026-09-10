@@ -162,12 +162,20 @@ impl McpServer {
         {
             return Ok(tool_text("Error: conversation handle is no longer known. Supply repository and necessary context to start fresh, or omit conversation_id for a new investigation.", true));
         }
-        let root = match conversations::select_repository(
-            &self.root,
-            explicit_root,
-            focus.as_deref(),
-            remembered.as_deref(),
-        ) {
+        let default = self.root.clone();
+        let explicit_root = explicit_root.map(str::to_owned);
+        let repository_focus = focus.clone();
+        let selection = tokio::task::spawn_blocking(move || {
+            conversations::select_repository(
+                &default,
+                explicit_root.as_deref(),
+                repository_focus.as_deref(),
+                remembered.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| rpc_error(-32603, format!("Repository selection failed: {error}")))?;
+        let root = match selection {
             Ok(root) => root,
             Err(error) => return Ok(tool_text(&format!("Error: {error}"), true)),
         };
@@ -1058,6 +1066,61 @@ fn rpc_error(code: i64, message: String) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_git_selection_does_not_block_runtime() {
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "REPOTRACER_SLOW_GIT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let git = dir.path().join("git");
+            std::fs::write(&git, "#!/bin/sh\nsleep 1\nprintf '%s\\n' \"$PWD\"\n").unwrap();
+            std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::slow_git_selection_does_not_block_runtime",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        dir.path().display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let startup = tempfile::tempdir().unwrap();
+        let selected = tempfile::tempdir().unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let server = McpServer::new(
+            Arc::new(CapturingScout { request: captured }),
+            startup.path().to_owned(),
+        );
+        let started = Instant::now();
+        let (response, elapsed) = tokio::join!(
+            server.tools_call(json!({"name": "repo_scout", "arguments": {
+                "query": "locate", "focus": selected.path().canonicalize().unwrap()
+            }})),
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                started.elapsed()
+            }
+        );
+        assert!(response.is_ok());
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "Git blocked the runtime for {elapsed:?}"
+        );
+    }
 
     #[tokio::test]
     async fn malformed_investigation_explains_retry_without_starting_scout() {

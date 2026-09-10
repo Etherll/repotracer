@@ -45,8 +45,8 @@ setup or after changing settings.
 
 Node.js 18 or newer is required for the npm launcher. Published native
 packages target macOS arm64 and x64, Linux arm64 and x64, and Windows x64.
-The v2 release candidate has been checked locally on Linux. CI checks for
-macOS and Windows are still pending.
+The v2 release candidate has passed GitHub CI on Linux, macOS, and Windows,
+including the native Codex app-server checks.
 
 ## Choose or change models
 
@@ -67,8 +67,10 @@ with Enter, or press A for advanced selection, to search both providers.
 Tab moves between mappings and the bottom buttons. Ctrl-S saves. There is
 no separate review screen.
 
-The custom entry format is `codex:model-id` or `claude:model-id`. A saved model
-that the current CLI does not report remains selectable with an
+The Custom API form accepts a base URL, model ID, and optional API key. Keys
+require HTTPS; unauthenticated local endpoints can use HTTP. Use the explicit
+flags below for native model IDs. A saved model that the current CLI does not
+report remains selectable with an
 "unverified" label. Missing or signed-out native CLIs have their
 models hidden with a short reason. Explicit native wrappers can supply their
 own route; if login status cannot verify that route, the catalog is labelled
@@ -207,8 +209,8 @@ RepoTracer does not promise lower cost, faster completion, or a particular
 answer quality. Provider pricing, model behavior, account limits, repository
 size, and parent-agent decisions all affect the result.
 
-The v2 release candidate has local Linux verification. macOS and Windows CI
-verification is pending. The native Codex and Claude Code CLIs remain required
+The v2 release candidate has passed GitHub CI on Linux, macOS, and Windows.
+The native Codex and Claude Code CLIs remain required
 for their respective subscription backends, and their supported flags and
 model catalog can vary by installed version.
 
@@ -216,6 +218,8 @@ See [the security notes](SECURITY.md), [the architecture reference](docs/ARCHITE
 and [the npm package guide](packages/npm/README.md).
 
 ## Develop
+
+Building from source requires Rust 1.90 or newer.
 
 ```bash
 cargo test --workspace
