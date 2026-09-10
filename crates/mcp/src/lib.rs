@@ -2,6 +2,8 @@
 //! NEVER write non-protocol text to stdout.
 
 mod conversations;
+mod evidence;
+use evidence::evidence_excerpts;
 mod transport;
 
 use repotracer_core::{
@@ -222,7 +224,9 @@ impl McpServer {
         };
 
         set_conversation(&mut result.stats, &id, &root);
-        Ok(handoff_response(&root, result))
+        tokio::task::spawn_blocking(move || handoff_response(&root, result))
+            .await
+            .map_err(|error| rpc_error(-32603, format!("Source handoff failed: {error}")))
     }
 }
 
@@ -317,6 +321,11 @@ fn handoff_response(root: &Path, mut result: ScoutResult) -> Value {
     let mut report_target = MAX_HANDOFF_BYTES / 2;
     let mut emergency_compaction = false;
     loop {
+        omissions.truncated_spans = spans.iter().filter(|span| span.truncated).count();
+        handoff_limitations.retain(|limitation| limitation != SOURCE_TRUNCATED);
+        if omissions.truncated_spans > 0 {
+            mark_source_truncated(&mut handoff_limitations);
+        }
         let response = build_handoff_response(&result, &spans, &omissions, &handoff_limitations);
         if response_size(&response) <= MAX_HANDOFF_BYTES {
             return response;
@@ -372,29 +381,17 @@ fn handoff_response(root: &Path, mut result: ScoutResult) -> Value {
             continue;
         }
 
-        if spans.len() == 1 && !spans[0].truncated {
-            let prior_limitations = handoff_limitations.len();
+        if spans.len() == 1 {
             mark_source_truncated(&mut handoff_limitations);
             // Include the metadata added by a successful truncation while
             // testing the candidate, then roll it back if the span is dropped.
-            omissions.truncated_spans += 1;
+            omissions.truncated_spans = 1;
             if truncate_last_span_to_fit(&mut spans, &result, &omissions, &handoff_limitations) {
                 continue;
             }
-            omissions.truncated_spans -= 1;
-            handoff_limitations.truncate(prior_limitations);
             let span = spans.pop().expect("length checked above");
             omissions.omitted_source_citations += span.citation_count;
             omissions.omitted_source_spans += 1;
-            mark_source_omitted(&mut handoff_limitations);
-            continue;
-        }
-
-        if spans.len() == 1 && spans[0].truncated {
-            let span = spans.pop().expect("length checked above");
-            omissions.omitted_source_citations += span.citation_count;
-            omissions.omitted_source_spans += 1;
-            omissions.truncated_spans = omissions.truncated_spans.saturating_sub(1);
             mark_source_omitted(&mut handoff_limitations);
             continue;
         }
@@ -487,11 +484,10 @@ fn mark_source_omitted(limitations: &mut Vec<String>) {
     );
 }
 
+const SOURCE_TRUNCATED: &str = "A source span was truncated to keep the complete MCP result within its transport budget; the missing source text does not by itself make a question unresolved.";
+
 fn mark_source_truncated(limitations: &mut Vec<String>) {
-    push_limitation(
-        limitations,
-        "A source span was truncated to keep the complete MCP result within its transport budget; the missing source text does not by itself make a question unresolved.".into(),
-    );
+    push_limitation(limitations, SOURCE_TRUNCATED.into());
 }
 
 fn build_handoff_response(
@@ -875,107 +871,6 @@ fn truncate_last_span_to_fit(
     true
 }
 
-fn evidence_excerpts(root: &Path, citations: &[ValidatedCitation]) -> EvidenceBundle {
-    #[derive(Debug)]
-    struct PathRanges {
-        path: String,
-        ranges: Vec<(u32, u32, usize)>,
-    }
-
-    let mut groups: Vec<PathRanges> = Vec::new();
-    let mut bundle = EvidenceBundle::default();
-    for citation in citations {
-        if citation.start_line == 0 || citation.end_line < citation.start_line {
-            bundle.omitted_citations += 1;
-            bundle.omitted_spans += 1;
-            continue;
-        }
-        let Some(group) = groups.iter_mut().find(|group| group.path == citation.path) else {
-            groups.push(PathRanges {
-                path: citation.path.clone(),
-                ranges: vec![(citation.start_line, citation.end_line, 1)],
-            });
-            continue;
-        };
-        group
-            .ranges
-            .push((citation.start_line, citation.end_line, 1));
-    }
-
-    for group in groups {
-        let Ok(path) = repotracer_repo_tools::resolve_in_root(root, &group.path) else {
-            bundle.omitted_citations += group.ranges.iter().map(|range| range.2).sum::<usize>();
-            bundle.omitted_spans += group.ranges.len();
-            continue;
-        };
-        let Ok(source) = std::fs::read_to_string(path) else {
-            bundle.omitted_citations += group.ranges.iter().map(|range| range.2).sum::<usize>();
-            bundle.omitted_spans += group.ranges.len();
-            continue;
-        };
-        let line_count = source.lines().count() as u32;
-        let mut ranges = group.ranges;
-        ranges.sort_by_key(|range| (range.0, range.1));
-        let mut merged: Vec<(u32, u32, usize)> = Vec::new();
-        for (start, end, count) in ranges {
-            if start > line_count || end > line_count {
-                bundle.omitted_citations += count;
-                bundle.omitted_spans += 1;
-                continue;
-            }
-            if let Some(previous) = merged.last_mut() {
-                if start <= previous.1.saturating_add(1) {
-                    previous.1 = previous.1.max(end);
-                    previous.2 += count;
-                    continue;
-                }
-            }
-            merged.push((start, end, count));
-        }
-        for (start_line, end_line, citation_count) in merged {
-            let text = render_source_span(&source, start_line, end_line);
-            if text.is_empty() {
-                bundle.omitted_citations += citation_count;
-                bundle.omitted_spans += 1;
-            } else {
-                bundle.spans.push(EvidenceSpan {
-                    priority: citations
-                        .iter()
-                        .position(|citation| {
-                            citation.path == group.path
-                                && citation.start_line <= end_line
-                                && citation.end_line >= start_line
-                        })
-                        .expect("span was constructed from a citation"),
-                    path: group.path.clone(),
-                    start_line,
-                    end_line,
-                    text,
-                    citation_count,
-                    truncated: false,
-                });
-            }
-        }
-    }
-    bundle
-}
-
-fn render_source_span(source: &str, start: u32, end: u32) -> String {
-    let mut excerpt = String::new();
-    let take = end.saturating_sub(start).saturating_add(1) as usize;
-    for (index, line) in source
-        .lines()
-        .enumerate()
-        .skip(start.saturating_sub(1) as usize)
-        .take(take)
-    {
-        excerpt.push_str(&format!("{}: {}\n", index + 1, line));
-    }
-    while excerpt.ends_with('\n') {
-        excerpt.pop();
-    }
-    excerpt
-}
 fn repo_scout_tool_def() -> Value {
     json!({
         "name": "repo_scout",
@@ -1850,6 +1745,47 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("100: source line 100"));
+    }
+
+    #[test]
+    fn handoff_reads_only_the_cited_part_of_a_large_file() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let mut file = std::fs::File::create(root.path().join("large.rs")).unwrap();
+        file.write_all(b"fn answer() {}\n\xff").unwrap();
+        file.set_len(64 * 1024 * 1024).unwrap();
+        let bundle = evidence_excerpts(
+            root.path(),
+            &[ValidatedCitation {
+                path: "large.rs".into(),
+                start_line: 1,
+                end_line: 1,
+                reason: None,
+            }],
+        );
+        assert_eq!(bundle.spans.len(), 1);
+        assert_eq!(bundle.spans[0].text, "1: fn answer() {}");
+        assert!(!bundle.spans[0].truncated);
+    }
+
+    #[test]
+    fn evidence_loading_caps_long_lines_before_handoff_serialization() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("long.rs"),
+            "λ".repeat(MAX_HANDOFF_BYTES * 4),
+        )
+        .unwrap();
+        let citations = [ValidatedCitation {
+            path: "long.rs".into(),
+            start_line: 1,
+            end_line: 1,
+            reason: None,
+        }];
+        let bundle = evidence_excerpts(root.path(), &citations);
+        assert_eq!(bundle.spans.len(), 1);
+        assert!(bundle.spans[0].text.len() <= MAX_HANDOFF_BYTES);
+        assert!(bundle.spans[0].truncated);
     }
 
     #[test]

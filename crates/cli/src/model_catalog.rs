@@ -447,7 +447,7 @@ async fn discover_async(providers: &[String]) -> Catalog {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AuthStatus {
+pub(crate) enum AuthStatus {
     Authenticated,
     NotAuthenticated,
     Unavailable,
@@ -463,7 +463,7 @@ fn auth_warning(provider: &str, status: AuthStatus) -> String {
     format!("{provider} models hidden: {reason}")
 }
 
-async fn native_auth_status(provider: &str, executable: &Path) -> AuthStatus {
+pub(crate) async fn native_auth_status(provider: &str, executable: &Path) -> AuthStatus {
     let args: &[&str] = match provider {
         "codex" => &["login", "status"],
         "claude" => &["auth", "status", "--json"],
@@ -475,6 +475,12 @@ async fn native_auth_status(provider: &str, executable: &Path) -> AuthStatus {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    if provider == "claude" {
+        // Check the same subscription environment the native scout receives.
+        for name in CLAUDE_API_ENVIRONMENT {
+            command.env_remove(name);
+        }
+    }
     let output = match tokio::time::timeout(timeout(), command.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {

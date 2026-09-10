@@ -53,6 +53,9 @@ impl RepoTracerConfig {
         file.write_all(text.as_bytes())?;
         file.as_file().sync_all()?;
         file.into_temp_path().persist(path)?;
+        // Persist the directory entry as well as the new file's contents.
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
 }

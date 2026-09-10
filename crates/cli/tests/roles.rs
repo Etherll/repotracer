@@ -43,6 +43,36 @@ else: sys.exit(2)
 }
 
 #[test]
+fn doctor_requires_verified_claude_authentication() {
+    for (body, ready) in [
+        ("printf '%s\\n' '{\"loggedIn\":false}'", false),
+        ("printf '%s\\n' '{\"loggedIn\":true}'", true),
+        ("printf '%s\\n' 'invalid-json'", false),
+        ("if [ -n \"$ANTHROPIC_API_KEY\" ]; then printf '%s\\n' '{\"loggedIn\":true}'; else printf '%s\\n' '{\"loggedIn\":false}'; fi", false),
+        ("exit 1", false),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let fake = root.join("claude");
+        fs::write(&fake, format!(
+            "#!/bin/sh\n[ \"$*\" = \"auth status --json\" ] || exit 9\n{body}\n"
+        )).unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = repotracer_core::RepoTracerConfig::default();
+        config.model.backend = "Claude-cli".into();
+        config.model.model = "sonnet".into();
+        config.model.executable = Some(fake.display().to_string());
+        config.save_to(&root.join("config.toml")).unwrap();
+        let output = cli(root).env("ANTHROPIC_API_KEY", "test-api-key")
+            .args(["--root", root.to_str().unwrap(), "--json", "doctor"])
+            .output().unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["ready"], ready, "{result}");
+        assert_eq!(output.status.success(), ready);
+    }
+}
+
+#[test]
 fn installs_both_and_changes_one_mapping_without_overwriting_the_other() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

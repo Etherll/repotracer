@@ -1,6 +1,7 @@
 use crate::types::ValidatedCitation;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -98,12 +99,7 @@ pub fn validate_citation(root: &Path, c: &Citation) -> Option<ValidatedCitation>
         return None;
     }
 
-    let content = std::fs::read(&path_canon).ok()?;
-    if content.contains(&0) {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&content);
-    let line_count = text.lines().count() as u32;
+    let line_count = source_line_count(std::fs::File::open(&path_canon).ok()?, c.end_line)?;
     if line_count == 0 {
         return None;
     }
@@ -126,6 +122,36 @@ pub fn validate_citation(root: &Path, c: &Citation) -> Option<ValidatedCitation>
     })
 }
 
+/// Validate locations using bounded buffers, stopping at the requested line.
+/// Binary bytes in the examined prefix and locations beyond the scan budget
+/// are rejected instead of reading an arbitrarily large file into memory.
+fn source_line_count(source: impl Read, last_requested: u32) -> Option<u32> {
+    const MAX_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+    let mut reader = BufReader::new(source.take(MAX_SCAN_BYTES));
+    let mut lines = 0;
+    let mut at_line_start = true;
+    loop {
+        let chunk = reader.fill_buf().ok()?;
+        if chunk.is_empty() {
+            return (reader.get_ref().limit() > 0).then_some(lines);
+        }
+        if chunk.contains(&0) {
+            return None;
+        }
+        for byte in chunk {
+            if at_line_start {
+                lines += 1;
+                if lines == last_requested {
+                    return Some(lines);
+                }
+            }
+            at_line_start = *byte == b'\n';
+        }
+        let consumed = chunk.len();
+        reader.consume(consumed);
+    }
+}
+
 pub fn validate_citations(root: &Path, citations: &[Citation]) -> Vec<ValidatedCitation> {
     citations
         .iter()
@@ -138,6 +164,31 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn validation_does_not_read_beyond_the_requested_lines() {
+        struct Source {
+            read: bool,
+        }
+        impl Read for Source {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                assert!(!self.read, "read the uncited remainder");
+                self.read = true;
+                buffer[..4].copy_from_slice(b"a\nb\n");
+                Ok(4)
+            }
+        }
+        assert_eq!(source_line_count(Source { read: false }, 2), Some(2));
+    }
+
+    #[test]
+    fn validation_bounds_long_lines_and_preserves_eof_and_binary_checks() {
+        assert_eq!(source_line_count(std::io::repeat(b'x'), 1), Some(1));
+        assert_eq!(source_line_count(std::io::repeat(b'x'), 2), None);
+        assert_eq!(source_line_count(&b"a\nb\n"[..], 10), Some(2));
+        assert_eq!(source_line_count(&b""[..], 1), Some(0));
+        assert_eq!(source_line_count(&b"a\0b"[..], 1), None);
+    }
 
     #[test]
     fn parses_final_answer() {

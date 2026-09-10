@@ -1,4 +1,5 @@
 use crate::agents;
+use crate::model_catalog::{native_auth_status, AuthStatus};
 use crate::subscription::{is_subscription_backend, CliScout};
 use anyhow::{bail, Result};
 use repotracer_core::RepoTracerConfig;
@@ -67,10 +68,23 @@ pub async fn run(root: &Path, cfg: &RepoTracerConfig, json_mode: bool) -> Result
         let executable = cfg.model.executable.as_deref().unwrap_or("claude");
         checks.push(
             if crate::claude::ClaudeScout::new(cfg).is_ok() && which::which(executable).is_ok() {
-                Check::ok(
-                    "Claude scout",
-                    "CLI available; subscription generation was not probed",
-                )
+                match native_auth_status("claude", Path::new(executable)).await {
+                    AuthStatus::Authenticated => Check::ok(
+                        "Claude scout",
+                        "CLI authenticated; subscription generation was not probed",
+                    ),
+                    AuthStatus::NotAuthenticated => Check::fail(
+                        "Claude scout",
+                        "Claude Code is not logged in; run claude auth login",
+                    ),
+                    AuthStatus::MissingCli => {
+                        Check::fail("Claude scout", "Claude Code CLI not found")
+                    }
+                    AuthStatus::Unavailable => Check::fail(
+                        "Claude scout",
+                        "could not verify Claude Code authentication",
+                    ),
+                }
             } else {
                 Check::fail(
                     "Claude scout",
