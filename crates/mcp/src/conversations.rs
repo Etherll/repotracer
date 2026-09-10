@@ -11,7 +11,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 const MAX_HANDLES: usize = 1024;
 
 struct Entry {
-    root: PathBuf,
+    root: Option<PathBuf>,
     gate: Arc<AsyncMutex<()>>,
     touched: Instant,
 }
@@ -27,16 +27,15 @@ impl Conversations {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
-            .map(|entry| entry.root.clone())
+            .and_then(|entry| entry.root.clone())
     }
 
-    pub async fn enter(&self, id: &str, root: &Path) -> Result<OwnedMutexGuard<()>> {
+    /// Join the conversation queue before any asynchronous repository work.
+    /// The transport polls each request once in arrival order to reserve it.
+    pub async fn enter(&self, id: &str) -> Result<OwnedMutexGuard<()>> {
         let gate = {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = entries.get_mut(id) {
-                if entry.root != root {
-                    bail!("conversation belongs to {}; omit conversation_id for a different repository", entry.root.display());
-                }
                 entry.touched = Instant::now();
                 entry.gate.clone()
             } else {
@@ -56,7 +55,7 @@ impl Conversations {
                 entries.insert(
                     id.to_owned(),
                     Entry {
-                        root: root.to_owned(),
+                        root: None,
                         gate: gate.clone(),
                         touched: Instant::now(),
                     },
@@ -65,6 +64,25 @@ impl Conversations {
             }
         };
         Ok(gate.lock_owned().await)
+    }
+
+    /// Bind validated repository metadata while holding the conversation guard.
+    pub fn bind(&self, id: &str, root: &Path) -> Result<()> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = entries
+            .get_mut(id)
+            .context("conversation was not reserved")?;
+        if let Some(previous) = &entry.root {
+            if previous != root {
+                bail!(
+                    "conversation belongs to {}; omit conversation_id for a different repository",
+                    previous.display()
+                );
+            }
+        } else {
+            entry.root = Some(root.to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -283,14 +301,13 @@ mod tests {
     #[tokio::test]
     async fn same_handle_waits_but_independent_handle_can_enter() {
         let registry = Conversations::default();
-        let root = tempfile::tempdir().unwrap();
-        let first = registry.enter("a", root.path()).await.unwrap();
-        let second = registry.enter("a", root.path());
+        let first = registry.enter("a").await.unwrap();
+        let second = registry.enter("a");
         tokio::pin!(second);
         tokio::select! {
             biased;
             _ = &mut second => panic!("same conversation must wait"),
-            independent = registry.enter("b", root.path()) => { drop(independent.unwrap()); }
+            independent = registry.enter("b") => { drop(independent.unwrap()); }
         }
         drop(first);
         assert!(second.await.is_ok());
@@ -300,14 +317,12 @@ mod tests {
     async fn metadata_eviction_never_evicts_active_handle() {
         let registry = Conversations::default();
         let root = tempfile::tempdir().unwrap();
-        let _active = registry.enter("active", root.path()).await.unwrap();
+        let _active = registry.enter("active").await.unwrap();
+        registry.bind("active", root.path()).unwrap();
         for n in 0..MAX_HANDLES + 2 {
-            drop(
-                registry
-                    .enter(&format!("id-{n}"), root.path())
-                    .await
-                    .unwrap(),
-            );
+            let id = format!("id-{n}");
+            let _turn = registry.enter(&id).await.unwrap();
+            registry.bind(&id, root.path()).unwrap();
         }
         assert!(registry.root("active").is_some());
         assert!(registry.root("id-0").is_none());

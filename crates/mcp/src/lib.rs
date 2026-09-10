@@ -154,6 +154,12 @@ impl McpServer {
             .conversation_id
             .clone()
             .unwrap_or_else(|| format!("rt-{}", uuid::Uuid::new_v4()));
+        // Reserve FIFO order before repository selection can yield. Related
+        // requests also read remembered roots only after the prior turn binds them.
+        let _conversation_turn = match self.conversations.enter(&id).await {
+            Ok(guard) => guard,
+            Err(error) => return Ok(tool_text(&format!("Error: {error}"), true)),
+        };
         let remembered = self.conversations.root(&id);
         if investigation.conversation_id.is_some()
             && id.starts_with("rt-")
@@ -196,11 +202,9 @@ impl McpServer {
             return Ok(tool_text(&format!("Error: {error}"), true));
         }
 
-        // Only this conversation waits. Independent IDs can run concurrently.
-        let _conversation_turn = match self.conversations.enter(&id, &root).await {
-            Ok(guard) => guard,
-            Err(error) => return Ok(tool_text(&format!("Error: {error}"), true)),
-        };
+        if let Err(error) = self.conversations.bind(&id, &root) {
+            return Ok(tool_text(&format!("Error: {error}"), true));
+        }
 
         let mut result = match self.scout.scout(request).await {
             Ok(result) => result,
@@ -1076,7 +1080,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
             let git = dir.path().join("git");
-            std::fs::write(&git, "#!/bin/sh\nsleep 1\nprintf '%s\\n' \"$PWD\"\n").unwrap();
+            std::fs::write(&git, "#!/bin/sh\nsleep 1\nprintf '%s\\n' \"$2\"\n").unwrap();
             std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -1102,20 +1106,32 @@ mod tests {
         let selected = tempfile::tempdir().unwrap();
         let captured = Arc::new(std::sync::Mutex::new(None));
         let server = McpServer::new(
-            Arc::new(CapturingScout { request: captured }),
+            Arc::new(CapturingScout {
+                request: captured.clone(),
+            }),
             startup.path().to_owned(),
         );
         let started = Instant::now();
-        let (response, elapsed) = tokio::join!(
+        let (response, follow_up, elapsed) = tokio::join!(
             server.tools_call(json!({"name": "repo_scout", "arguments": {
-                "query": "locate", "focus": selected.path().canonicalize().unwrap()
+                "query": "first", "focus": selected.path().canonicalize().unwrap(),
+                "investigation": {"conversation_id": "same"}
+            }})),
+            server.tools_call(json!({"name": "repo_scout", "arguments": {
+                "query": "follow-up", "repository": selected.path(),
+                "investigation": {"conversation_id": "same"}
             }})),
             async {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 started.elapsed()
             }
         );
-        assert!(response.is_ok());
+        assert!(!response.unwrap()["isError"].as_bool().unwrap_or(false));
+        assert!(!follow_up.unwrap()["isError"].as_bool().unwrap_or(false));
+        assert_eq!(
+            captured.lock().unwrap().as_ref().unwrap().query,
+            "follow-up"
+        );
         assert!(
             elapsed < Duration::from_millis(500),
             "Git blocked the runtime for {elapsed:?}"

@@ -1293,9 +1293,17 @@ mod tests {
         output.read_to_end(&mut bytes).await.unwrap();
         serving.await.unwrap().unwrap();
 
+        let entered = entered.lock().unwrap();
+        assert_eq!(entered.len(), 3);
+        // Repository selection can finish in either order across independent
+        // handles. Only follow-ups on the same handle promise FIFO execution.
         assert_eq!(
-            *entered.lock().unwrap(),
-            vec!["same-1", "independent", "same-2"]
+            entered
+                .iter()
+                .filter(|query| query.starts_with("same-"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["same-1", "same-2"]
         );
         assert!(independent_beat_slow.load(Ordering::SeqCst));
         assert_eq!(
