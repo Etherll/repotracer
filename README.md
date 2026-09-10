@@ -1,230 +1,254 @@
-# RepoTracer
+<p align="center">
+  <img src="assets/logo-lockup-stacked.svg" alt="RepoTracer" width="260">
+</p>
 
-RepoTracer adds a read-only repository scout to Codex and Claude Code. The
-`repo_scout` MCP tool investigates a repository with native read tools and
-returns an explanation with source excerpts and file citations. The parent
-agent decides what to do with that context and remains responsible for edits.
+<h3 align="center">Search with Luna. Code with Sol. Never burn turns finding files.</h3>
+
+<p align="center">
+  Make your Codex subscription last up to 2.7x longer. A cheaper model searches your repo via MCP so Codex spends its quota writing code, not finding it.
+</p>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/repotracer"><img src="https://img.shields.io/npm/v/repotracer?color=0E9488&label=npm" alt="npm version"></a>
   <a href="https://github.com/repotracer/repotracer/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-purple" alt="MCP compatible"></a>
+  <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-purple" alt="MCP Compatible"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platforms">
 </p>
 
-## Install
+<p align="center">
+  <a href="#install"><img src="assets/button-install.svg" alt="Install RepoTracer" height="38"></a>&nbsp;
+  <a href="./BENCHMARKS.md"><img src="assets/button-benchmarks.svg" alt="Benchmarks" height="38"></a>&nbsp;
+  <a href="https://repotracer.tech"><img src="assets/button-website.svg" alt="repotracer.tech" height="38"></a>
+</p>
 
-Install from npm:
+```bash
+npx repotracer@latest setup
+```
+<p align="center">
+  <b>~63% cheaper (2.68x quota stretch) · ~25% faster · 0 regressions · 0 hallucinated paths</b><br>
+  <sub>Measured on real paired runs (DeepSWE, SWE-bench Astropy, and production bug fixes) with complete scout costs counted. <a href="./BENCHMARKS.md">Full writeup</a> · <a href="./benchmarks/README.md">Reproduce it</a></sub>
+</p>
+
+<p align="center">
+  <img src="assets/demo/scout.gif" alt="The scout engine finding four verified file and line-range citations in 35 seconds" width="100%"><br>
+  <sub>What the <code>repo_scout</code> MCP tool runs under the hood: plain query in, Luna searches with Read/Glob/Grep, disk-verified <code>file:line</code> citations out in ~35s.</sub>
+</p>
+
+## The problem
+
+Codex subscriptions have a fixed monthly budget. Every time Codex searches your repository, reading files, grepping for symbols, mapping dependencies, it burns that budget on work that writes zero lines of code.
+
+On the tasks we measured, search ate 30-60% of the total cost. That budget could have gone toward actual edits.
+
+RepoTracer moves search to Luna, a model that costs a fraction of Sol, through an MCP tool call. Same code gets written. Your subscription lasts longer.
+
+## What you get
+
+**Codex calls a tool, not a suggestion.** `repo_scout(query)` is an MCP tool call. Codex can't ignore it, reinterpret it, or go Google how to do it. It calls the function, gets results.
+
+**Cheap search, not cheap quality.** Each scout runs in its own thread with just the query and read-only access. No conversation history dragged along. Costs a fraction of a full subagent.
+
+**No hallucinated paths.** Every file path and line range gets checked before Codex sees it. If Luna returns a file that doesn't exist, RepoTracer drops it.
+
+**Knows when to do nothing.** 42/42 routing decisions correct. If the edit target is already obvious, no scout runs. You don't pay for a search you don't need.
+
+**One command.** `npx repotracer@latest setup`. No API keys, no background service, no Rust toolchain. Uses your existing Codex login.
+
+**Updates itself.** New versions download and verify automatically when Codex starts. Nothing to maintain.
+
+## Install
 
 ```bash
 npx repotracer@latest setup
 ```
 
-In an interactive terminal, setup opens a two-step wizard:
+`setup` downloads the native binary, verifies its SHA-256 checksum, installs it under `~/.repotracer/bin`, registers the MCP server, and adds a managed routing block to `~/.codex/AGENTS.md`. It reuses your existing Codex login.
 
-1. Choose Codex, Claude Code, or both.
-2. Keep the recommended models and Save, or select a scout to search other models.
+No Rust toolchain, second API key, background service, or hand-written config is required.
 
-The v2 defaults are Codex parent -> Codex scout with `gpt-5.6-luna`, and
-Claude Code parent -> Claude scout with `sonnet`. These are configuration
-defaults, not quality or cost guarantees. RepoTracer uses the login owned by
-the selected native CLI. It does not ask for a second subscription key.
-
-For a scripted install, choose the parent integrations explicitly:
+**Need to remove or reconfigure?** Run the same command again and pick *Uninstall*:
 
 ```bash
-npx repotracer@latest setup --agents codex
-npx repotracer@latest setup --agents claude
-npx repotracer@latest setup --agents both
-npx repotracer@latest setup --agents both --dry-run
+npx repotracer@latest setup
 ```
 
-The Codex parent requires the `codex` CLI. The Claude Code parent requires the
-`claude` CLI. Setup checks that the required executable is available, but
-authentication happens when a scout runs. Restart the parent agent after
-setup or after changing settings.
+```text
+RepoTracer is already configured.
+Use arrow keys, then Enter. Esc to cancel.
 
-Node.js 18 or newer is required for the npm launcher. Published native
-packages target macOS arm64 and x64, Linux arm64 and x64, and Windows x64.
-The v2 release candidate has passed GitHub CI on Linux, macOS, and Windows,
-including the native Codex app-server checks.
+  > Update the configuration
+    Uninstall RepoTracer
+```
 
-## Choose or change models
+That removes the MCP entry, the routing block, and the local config. Your Codex login and settings are untouched, and every file it edits is backed up alongside the original first. `repotracer uninstall --yes` does the same thing without the menu.
 
-Run the same terminal wizard later with:
+Preview the changes:
 
 ```bash
-repotracer settings
+npx repotracer@latest setup --dry-run
 ```
 
-`repotracer reconfigure` is an alias. The wizard keeps already configured
-parents selected. Unchecking an existing parent leaves it unchanged; it does
-not uninstall it. Nothing is written until Save. Esc goes back; Ctrl-C cancels
-from anywhere.
-
-Setup recommends Luna for Codex and Sonnet for Claude Code when available.
-Settings keeps saved choices. Mappings stay visible at the top; select one
-with Enter, or press A for advanced selection, to search both providers.
-Tab moves between mappings and the bottom buttons. Ctrl-S saves. There is
-no separate review screen.
-
-The Custom API form accepts a base URL, model ID, and optional API key. Keys
-require HTTPS; unauthenticated local endpoints can use HTTP. Use the explicit
-flags below for native model IDs. A saved model that the current CLI does not
-report remains selectable with an
-"unverified" label. Missing or signed-out native CLIs have their
-models hidden with a short reason. Explicit native wrappers can supply their
-own route; if login status cannot verify that route, the catalog is labelled
-unverified. Model discovery does not start an investigation.
-
-For automation, use explicit flags instead of the TUI:
+Want the `repotracer` command in your own shell too?
 
 ```bash
-repotracer settings --agents both \
-  --codex-scout codex --codex-model gpt-5.6-luna \
-  --claude-scout claude --claude-model sonnet
+npm install -g repotracer
+# or
+cargo install --git https://github.com/repotracer/repotracer --locked repotracer
 ```
 
-Use `--dry-run` to preview settings without writing them. Each parent gets an
-independent profile, so changing one mapping does not silently change the
-other.
+## Updating
 
-## How the scout works
+RepoTracer updates itself. Each time its MCP server starts, it checks the release
+feed, verifies the new binary's SHA-256 against the published checksums, and
+replaces the copy in `~/.repotracer/bin`. The new version takes effect the next
+time you start Codex.
 
-The MCP server exposes `repo_scout` over stdio. It gives the native scout a
-question and optional repository hints. Claude reads with Read, Glob, and
-Grep. Codex uses its native read-only shell and the optional Symbols lookup.
-Edits, network tools, and external MCP tools are disabled. The parent agent
-receives a structured result and a readable text
-fallback.
+It only ever replaces that one binary, then refreshes RepoTracer's managed MCP
+entry and `AGENTS.md` block. A `cargo install` build or source checkout is left
+alone.
 
-The query does not include the parent conversation automatically. Include the
-requirements and compatibility constraints that affect the investigation:
+Automatic updates are on by default. Restart Codex after an update for the new
+binary and managed integration files to take effect. To disable automatic
+updates, set `updates.automatic = false` in `~/.repotracer/config.toml` or set
+`REPOTRACER_NO_UPDATE=1`. You can still update a disabled installation with
+`npx repotracer@latest setup`.
 
-```json
-{
-  "query": "Trace configuration loading and identify the callers that depend on precedence.",
-  "repository": "/work/project",
-  "focus": "src/config",
-  "investigation": {
-    "intent": "change_impact",
-    "reasoning_effort": "high",
-    "target_paths": ["src/config", "tests"]
-  }
-}
-```
-
-Supported `intent` values are `locate`, `explain`, `change_impact`,
-`diagnose`, and `inventory`. `reasoning_effort` accepts `low`, `medium`,
-`high`, `xhigh`, or `max` when the selected provider and model support it.
-Omit it to use the configured effort.
-
-An investigation result includes a model-authored report, source blocks when
-available, and citations. RepoTracer validates that cited paths and line
-ranges resolve inside the selected repository. That validation checks
-locations, not whether the scout's conclusions are true. Treat the report as
-evidence to review, not as a proof of correctness.
-
-For a related follow-up, pass the returned `conversation.id` as
-`investigation.conversation_id`. The handle is tied to its repository.
-`conversation.status` reports whether the native attempt resumed, started
-fresh, or could not be determined. Omit the handle for an independent
-question.
-
-## Sessions and timeouts
-
-Warm provider processes are enabled by default. A warm process may be retained
-for related work and retired after `session.idle_secs` of inactivity, which is
-300 seconds by default. This is an idle-retention limit, not a total request
-or investigation timeout.
-
-The main timeout settings are opt-in:
-
-- `model.timeout_ms` is a native stream-inactivity limit. Incoming stream
-  activity resets it. `0` disables it.
-- `explorer.timeout_seconds` is a whole-investigation limit for the generic
-  OpenAI-compatible engine only. Native Codex and Claude scouts do not use it.
-- `explorer.tool_timeout_seconds` limits individual tools in that generic
-  engine and defaults to 10 seconds.
-
-The parent caller may also impose its own MCP request allowance. A caller
-allowance does not change the scout's turn budget. `explorer.max_turns = 0`
-leaves investigation depth to the native scout; a positive value is an
-explicit ceiling for backends that support it.
-
-## CLI and MCP commands
+To update on the spot:
 
 ```bash
-repotracer "where is authentication handled?"
-repotracer scout "trace token refresh" --intent diagnose
-repotracer symbols "Config" --mode references
-repotracer serve
+repotracer update
+```
+
+## How it works
+
+```text
+You ask Codex to fix something
+  Codex decides it needs to find code first
+  calls repo_scout(query) via MCP
+    RepoTracer spins up an isolated Luna thread
+    Luna searches with Read, Glob, Grep
+    RepoTracer validates every path and line range
+  Codex gets back verified file:line citations
+  Codex reads the cited code and makes the edit
+```
+
+The scout runs GPT-5.6 Luna at medium reasoning on the fast service tier. It starts clean, no conversation history, no inherited context, and can only read. It cannot edit, delete, commit, or push.
+
+One tool call. Structured output. Verified results. No prompt interpretation, no web searches for "how to start a Luna agent."
+
+## "Can't I just put 'use Luna' in agents.md?"
+
+You can try. We did. Here's what happens.
+
+Sol doesn't have to follow prompt instructions. It interprets them however it wants, or ignores them, or goes and searches the web for "how to start a Luna agent" instead of starting one. An MCP tool call is a function call. Sol calls it, gets back results, moves on.
+
+Subagents also inherit the full conversation context. On a long session that inherited context alone can cost more than the search was supposed to save. RepoTracer starts an isolated thread with only the query and read-only tools. No history.
+
+And raw Luna output is inconsistent. Without validation you get wrong paths, bad line numbers, phantom files. RepoTracer checks every citation before returning it. Bad results get dropped.
+
+We spent weeks benchmarking both approaches. The one-line agents.md instruction consistently cost more than not using it at all. The MCP approach is the one that actually showed up in the numbers.
+
+## Benchmarks
+
+Tested on DeepSWE (industry-standard multi-language coding tasks) and MAH-SWE (a benchmark built from real agentic coding sessions on production repositories, not synthetic prompts).
+
+Complete task cost, RepoTracer's usage included.
+
+| Task | Source | Cost saved | Same budget gets you | Quality |
+|---|---|---:|---:|---|
+| Real bug fix, production repo | MAH-SWE | −62.68% | **2.68x the tasks** | Both arms worked |
+| SWE-bench Astropy 13453 | SWE-bench | −50.12% | **2x the tasks** | Regression passed |
+| Release benchmark (TS, Python, Go) | DeepSWE | −27.71% | **1.38x the tasks** | 147/151 features |
+| Median of 3 paired runs | DeepSWE | −39.20% | **1.64x the tasks** | 6/6 checks every arm |
+
+If a task costs 62.68% less, a fixed budget covers 2.68 of them instead of 1. That's where the 2.7x headline comes from.
+
+Paired runs hold everything constant: same model, same prompt, same repo commit, same timeout. The only difference is whether RepoTracer is installed.
+
+42/42 routing decisions correct. 24/24 holdout. 3/3 real-task runs passed both verifiers. 87 workspace tests passing, formatting and strict Clippy clean.
+
+Every run is published with raw artifacts. [Full methodology, evidence, and benchmarks.](./BENCHMARKS.md)
+
+## Automatic routing across all tasks (zero manual switching)
+
+You never need to turn RepoTracer on or off. Leave it installed and keep prompting Codex normally for every task.
+
+The built-in router (42/42 verified decisions) automatically chooses the optimal route for every prompt:
+- **Broad exploration & cross-file tasks:** Delegates search to Luna via MCP, slashing complete task spend by up to 63%.
+- **Small or single-file edits:** Handles the task directly with Sol with zero scout calls, zero latency penalty, and zero overhead.
+
+You get massive savings on complex tasks with zero penalty on small edits.
+## Current support
+
+| Item | Current value |
+|---|---|
+| Coding agent | Codex |
+| Interface | MCP and CLI |
+| Default scout | `gpt-5.6-luna` |
+| Scout service tier | `fast` |
+| Scout reasoning | `medium` |
+| Scout tools | Read, Glob, Grep |
+| Repository writes | Disabled |
+| Custom backend | OpenAI-compatible GPT endpoint |
+
+Luna medium is the production default because it hits the optimal performance frontier: **4.00/4.00 (24/24 perfect evaluations)** in double-blind quality grading, delivering comprehensive source grounding in ~58s without the latency or token bloat of higher tiers.
+
+## CLI
+
+```bash
+repotracer "where is auth handled?"      # scout the current repository
+repotracer scout "trace refresh rotation"
+repotracer serve                         # MCP over stdio
+repotracer setup
+repotracer update                         # replace the binary with the newest release
 repotracer doctor
 repotracer status
 repotracer config --init
-repotracer update
+repotracer benchmark
 repotracer uninstall --yes
 ```
 
-The first form is shorthand for `scout`. `serve` runs the MCP server over
-stdio. `symbols` performs a local syntax lookup without a model call. Add
-`--json` to `scout`, `doctor`, or `status` for machine-readable output.
+`--json` is available on `scout`, `doctor`, and `status`.
 
-The MCP tool requires only `query`:
+### Custom GPT endpoint
 
-```json
-{
-  "query": "Find the code that loads the application configuration."
-}
+```bash
+repotracer \
+  --base-url https://models.example.com/v1 \
+  --model gpt-5.6-mini \
+  setup
 ```
 
-`repository`, `focus`, and `investigation` are optional. Absolute repository
-paths must identify the selected checkout. Parent-directory traversal and
-symlink escapes are rejected. RepoTracer's boundary is an application-level
-read-only check, not an operating-system filesystem sandbox.
+Set `REPOTRACER_API_KEY` when the endpoint requires authentication.
 
-## Configuration and updates
+## Security
 
-`repotracer config --init` writes the default configuration. The installed npm
-launcher stores its configuration under the user's RepoTracer directory and
-parent-specific profiles beside it. `REPOTRACER_CONFIG` selects another config
-file. `REPOTRACER_API_KEY` is read only for an explicitly configured
-OpenAI-compatible backend.
+- Read-only repository access
+- Repository-root and symlink-escape checks
+- Returned path and line-range validation
+- No default telemetry
+- Provider credentials remain with the official CLI
 
-Automatic binary updates are enabled by default for the npm-installed copy.
-The server verifies the published checksum before replacing that copy. Disable
-updates with:
+See [SECURITY.md](./SECURITY.md).
 
-```toml
-[updates]
-automatic = false
-```
+## Resources
 
-or set `REPOTRACER_NO_UPDATE=1`. `repotracer update` performs an update on
-request. Source builds and `cargo install` copies are not replaced by the
-automatic updater.
+- [repotracer.tech](https://repotracer.tech)
+- [Benchmarks](./BENCHMARKS.md)
+- [Architecture](./docs/ARCHITECTURE.md)
+- [Why complete-task measurement matters](./docs/benchmarks/why-token-counters-lie.md)
+- [Microsoft FastContext paper](https://arxiv.org/abs/2606.14066v3)
 
-## Limitations and verification
-
-RepoTracer does not promise lower cost, faster completion, or a particular
-answer quality. Provider pricing, model behavior, account limits, repository
-size, and parent-agent decisions all affect the result.
-
-The v2 release candidate has passed GitHub CI on Linux, macOS, and Windows.
-The native Codex and Claude Code CLIs remain required
-for their respective subscription backends, and their supported flags and
-model catalog can vary by installed version.
-
-See [the security notes](SECURITY.md), [the architecture reference](docs/ARCHITECTURE.md),
-and [the npm package guide](packages/npm/README.md).
+RepoTracer is an independent project inspired by FastContext. It is not affiliated with or endorsed by Microsoft. See [NOTICE](./NOTICE).
 
 ## Develop
-
-Building from source requires Rust 1.90 or newer.
 
 ```bash
 cargo test --workspace
 cargo run -p repotracer -- doctor
-cargo run -p repotracer -- scout "where is configuration loaded?" --mock
+cargo run -p repotracer -- scout "where is config loaded?" --mock
 ```
 
-RepoTracer is MIT licensed. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+## License
+
+MIT. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
