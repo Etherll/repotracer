@@ -30,10 +30,14 @@ fn dry_run_plans_zero_question_gpt_setup_without_writes() {
 }
 
 #[test]
-fn custom_setup_accepts_only_gpt_models() {
+fn custom_setup_accepts_arbitrary_model_ids() {
     let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config.toml");
+    let integrations = config.with_extension("integrations.json");
+    std::fs::write(&integrations, r#"{"parents":["codex","claude"]}"#).unwrap();
     let mut command = Command::cargo_bin("repotracer").unwrap();
     command
+        .env("REPOTRACER_CONFIG", &config)
         .args([
             "--root",
             root.path().to_str().unwrap(),
@@ -51,6 +55,7 @@ fn custom_setup_accepts_only_gpt_models() {
 
     let mut command = Command::cargo_bin("repotracer").unwrap();
     command
+        .env("REPOTRACER_CONFIG", &config)
         .args([
             "--root",
             root.path().to_str().unwrap(),
@@ -62,8 +67,13 @@ fn custom_setup_accepts_only_gpt_models() {
             "--dry-run",
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("currently supports GPT models"));
+        .success()
+        .stdout(predicate::str::contains("scout: claude"));
+    assert!(!config.exists());
+    assert_eq!(
+        std::fs::read_to_string(integrations).unwrap(),
+        r#"{"parents":["codex","claude"]}"#
+    );
 }
 
 #[test]
@@ -121,13 +131,19 @@ fn setup_does_not_require_an_existing_codex_login() {
         .contains("mcp_servers.repotracer"));
     assert!(std::fs::read_to_string(codex_home.join("AGENTS.md"))
         .unwrap()
-        .contains("After a successful handoff"));
+        .contains("query alone is enough"));
 }
 
 #[test]
 fn updater_refreshes_the_managed_codex_files() {
     let home = tempfile::tempdir().unwrap();
     let codex_home = home.path().join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(
+        codex_home.join("config.toml"),
+        "[mcp_servers.repotracer]\ncommand = \"old\"\nargs = [\"serve\", \"--config\", \"a path/profile.toml\"]\nstartup_timeout_sec = 77\n",
+    )
+    .unwrap();
 
     let mut command = Command::cargo_bin("repotracer").unwrap();
     command
@@ -141,6 +157,18 @@ fn updater_refreshes_the_managed_codex_files() {
     assert!(std::fs::read_to_string(codex_home.join("config.toml"))
         .unwrap()
         .contains("mcp_servers.repotracer"));
+    let updated: toml::Value = std::fs::read_to_string(codex_home.join("config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        updated["mcp_servers"]["repotracer"]["args"][2].as_str(),
+        Some("a path/profile.toml")
+    );
+    assert_eq!(
+        updated["mcp_servers"]["repotracer"]["startup_timeout_sec"].as_integer(),
+        Some(77)
+    );
     assert!(std::fs::read_to_string(codex_home.join("AGENTS.md"))
         .unwrap()
         .contains("repotracer:start"));
@@ -169,6 +197,32 @@ api_key = "secret-provider-token"
         .success()
         .stdout(predicate::str::contains("<redacted>"))
         .stdout(predicate::str::contains("secret-provider-token").not());
+}
+
+#[test]
+fn config_and_status_diagnostics_redact_provider_credentials() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config.toml");
+    std::fs::write(
+        &config,
+        r#"[model]
+backend = "openai-compatible"
+model = "vendor/private"
+base_url = "https://models.example.com/v1?api_key=url-secret"
+api_key = "secret-provider-token"
+"#,
+    )
+    .unwrap();
+
+    let mut command = Command::cargo_bin("repotracer").unwrap();
+    command
+        .env("REPOTRACER_CONFIG", &config)
+        .arg("config")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<redacted>"))
+        .stdout(predicate::str::contains("secret-provider-token").not())
+        .stdout(predicate::str::contains("url-secret").not());
 }
 
 #[test]

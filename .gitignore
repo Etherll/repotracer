@@ -10,6 +10,7 @@ node_modules/
 packages/npm/vendor/
 benchmarks/results/**/raw.jsonl
 benchmarks/results/private/
+benchmarks/runners/__pycache__/
 benchmarks/results/runs/**/private/
 benchmarks/results/runs/**/trajectory.jsonl
 benchmarks/results/runs/**/{stdout,stderr}.log
@@ -29,7 +30,18 @@ docs/benchmarks/*.log
 # Personal research notes, plans, and internal docs
 references/research/
 research/
+docs/research/
+docs/benchmarks/
+benchmarks/
+crates/bench/
+assets/button-benchmarks.svg
+assets/benchmark-card.png
+assets/results-proof.png
+scripts/summarize-results
+scripts/summarize-results.py
+BENCHMARKS.md
 docs/.internal/
+docs/launch/
 RESEARCH*.md
 *PLAN*.md
 *.pdf

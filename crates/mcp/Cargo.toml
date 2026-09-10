@@ -2,6 +2,7 @@
 name = "repotracer-mcp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "MCP server for repotracer"
 repository.workspace = true
@@ -9,6 +10,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 repotracer-core.workspace = true
+repotracer-repo-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

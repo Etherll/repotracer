@@ -1,5 +1,4 @@
 use crate::agents;
-use crate::config;
 use crate::subscription::{is_subscription_backend, CliScout};
 use anyhow::{bail, Result};
 use repotracer_core::RepoTracerConfig;
@@ -20,7 +19,7 @@ pub async fn run(
     if already_installed && !dry_run {
         match prompt_existing_install()? {
             ExistingChoice::Update => {}
-            ExistingChoice::Uninstall => return uninstall(root, true),
+            ExistingChoice::Uninstall => return uninstall(root, cfg_path, true),
             ExistingChoice::Cancel => {
                 println!("Cancelled. Nothing was changed.");
                 return Ok(());
@@ -44,7 +43,8 @@ pub async fn run(
             true,
             &format!(
                 "scout: {} via {}",
-                selected_cfg.model.model, selected_cfg.model.base_url
+                selected_cfg.model.model,
+                crate::redact_endpoint(&selected_cfg.model.base_url)
             ),
         );
         item(true, &codex_message);
@@ -103,17 +103,8 @@ fn gpt_config(cfg: &RepoTracerConfig) -> Result<RepoTracerConfig> {
     match selected.model.backend.to_ascii_lowercase().as_str() {
         "codex" | "codex-cli" => {
             selected.model.backend = "codex-cli".into();
-            if !selected.model.model.starts_with("gpt-") {
-                selected.model.model = "gpt-5.6-luna".into();
-            }
         }
         "openai" | "openai-compatible" => {
-            if !selected.model.model.starts_with("gpt-") {
-                bail!(
-                    "unsupported model `{}`; RepoTracer currently supports GPT models",
-                    selected.model.model
-                );
-            }
             selected.model.backend = "openai-compatible".into();
         }
         _ => {
@@ -122,6 +113,9 @@ fn gpt_config(cfg: &RepoTracerConfig) -> Result<RepoTracerConfig> {
             selected.model.model = "gpt-5.6-luna".into();
             selected.model.api_key = None;
         }
+    }
+    if crate::subscription::is_subscription_backend(&selected) {
+        selected.model.reasoning_effort = selected.model.native_reasoning_effort().to_string();
     }
     Ok(selected)
 }
@@ -144,7 +138,7 @@ fn verify_codex_available(cfg: &RepoTracerConfig, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn uninstall(root: &Path, yes: bool) -> Result<()> {
+pub fn uninstall(root: &Path, cfg: &Path, yes: bool) -> Result<()> {
     if !yes {
         println!("This removes RepoTracer MCP entries, skills, and project routing instructions.");
         println!("Re-run with --yes to confirm.");
@@ -153,9 +147,8 @@ pub fn uninstall(root: &Path, yes: bool) -> Result<()> {
     for message in agents::uninstall_all(root)? {
         item(true, &message);
     }
-    let cfg = config::default_config_path();
     if cfg.exists() {
-        std::fs::remove_file(&cfg)?;
+        std::fs::remove_file(cfg)?;
         item(true, &format!("removed {}", cfg.display()));
     }
     println!("Uninstall complete. Provider logins and the RepoTracer binary were left in place.");
@@ -188,7 +181,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn setup_normalizes_to_luna_and_rejects_non_gpt_endpoints() {
+    fn setup_preserves_custom_endpoint_models_and_normalizes_unknown_backends() {
         let mut legacy = RepoTracerConfig::default();
         legacy.model.backend = "ollama".into();
         legacy.model.model = "fastcontext".into();
@@ -204,6 +197,9 @@ mod tests {
         assert!(!gpt_config(&legacy).unwrap().updates.automatic);
 
         legacy.model.backend = "openai-compatible".into();
-        assert!(gpt_config(&legacy).is_err());
+        legacy.model.model = "vendor.reasoner-v9".into();
+        let selected = gpt_config(&legacy).unwrap();
+        assert_eq!(selected.model.backend, "openai-compatible");
+        assert_eq!(selected.model.model, "vendor.reasoner-v9");
     }
 }

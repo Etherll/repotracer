@@ -1,4 +1,5 @@
 use crate::agents;
+use crate::model_catalog::{native_auth_status, AuthStatus};
 use crate::subscription::{is_subscription_backend, CliScout};
 use anyhow::{bail, Result};
 use repotracer_core::RepoTracerConfig;
@@ -63,7 +64,35 @@ pub async fn run(root: &Path, cfg: &RepoTracerConfig, json_mode: bool) -> Result
     });
 
     // Configured scout backend
-    if is_subscription_backend(cfg) {
+    if cfg.model.is_claude() {
+        let executable = cfg.model.executable.as_deref().unwrap_or("claude");
+        checks.push(
+            if crate::claude::ClaudeScout::new(cfg).is_ok() && which::which(executable).is_ok() {
+                match native_auth_status("claude", Path::new(executable)).await {
+                    AuthStatus::Authenticated => Check::ok(
+                        "Claude scout",
+                        "CLI authenticated; subscription generation was not probed",
+                    ),
+                    AuthStatus::NotAuthenticated => Check::fail(
+                        "Claude scout",
+                        "Claude Code is not logged in; run claude auth login",
+                    ),
+                    AuthStatus::MissingCli => {
+                        Check::fail("Claude scout", "Claude Code CLI not found")
+                    }
+                    AuthStatus::Unavailable => Check::fail(
+                        "Claude scout",
+                        "could not verify Claude Code authentication",
+                    ),
+                }
+            } else {
+                Check::fail(
+                    "Claude scout",
+                    "invalid configuration or missing Claude Code CLI",
+                )
+            },
+        );
+    } else if is_subscription_backend(cfg) {
         match CliScout::from_config(cfg) {
             Ok(scout) => {
                 let installed =
@@ -90,6 +119,8 @@ pub async fn run(root: &Path, cfg: &RepoTracerConfig, json_mode: bool) -> Result
         }
     } else {
         let backend = OpenAiCompatBackend::new(ModelConfig {
+            reasoning_effort: (!cfg.model.reasoning_effort.trim().is_empty())
+                .then(|| cfg.model.reasoning_effort.clone()),
             base_url: cfg.model.base_url.clone(),
             model: cfg.model.model.clone(),
             api_key: cfg.model.resolved_api_key(),
@@ -108,7 +139,11 @@ pub async fn run(root: &Path, cfg: &RepoTracerConfig, json_mode: bool) -> Result
                 checks.push(match backend.complete(request).await {
                     Ok(_) => Check::ok(
                         "model",
-                        &format!("{} @ {}", cfg.model.model, cfg.model.base_url),
+                        &format!(
+                            "{} @ {}",
+                            cfg.model.model,
+                            crate::redact_endpoint(&cfg.model.base_url)
+                        ),
                     ),
                     Err(error) => Check::fail("model", &error.to_string()),
                 });

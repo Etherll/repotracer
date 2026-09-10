@@ -98,7 +98,20 @@ test('setup persists the npx binary but dry-run does not', (t) => {
   fs.writeFileSync(source, 'native-binary', { mode: 0o755 });
 
   assert.equal(persistForSetup(source, ['setup', '--dry-run'], home), source);
+  assert.equal(persistForSetup(source, ['settings', '--dry-run'], home), source);
+  assert.equal(persistForSetup(source, ['reconfigure', '--dry-run'], home), source);
   assert.equal(fs.existsSync(installed), false);
+
+  for (const args of [
+    ['scout', 'settings'],
+    ['explain', 'setup'],
+    ['--root', 'settings', 'scout', 'setup'],
+    ['--config=reconfigure', 'scout', 'settings'],
+    ['--', 'setup'],
+  ]) {
+    assert.equal(persistForSetup(source, args, home), source);
+    assert.equal(fs.existsSync(installed), false);
+  }
 
   const destination = persistForSetup(source, ['setup'], home);
   assert.equal(fs.readFileSync(destination, 'utf8'), 'native-binary');
@@ -106,4 +119,13 @@ test('setup persists the npx binary but dry-run does not', (t) => {
   fs.writeFileSync(source, 'updated-binary', { mode: 0o755 });
   assert.equal(persistForSetup(source, ['setup'], home), destination);
   assert.equal(fs.readFileSync(destination, 'utf8'), 'updated-binary');
+  fs.writeFileSync(source, 'settings-binary', { mode: 0o755 });
+  assert.equal(persistForSetup(source, ['settings'], home), destination);
+  assert.equal(fs.readFileSync(destination, 'utf8'), 'settings-binary');
+  fs.writeFileSync(source, 'reconfigure-binary', { mode: 0o755 });
+  assert.equal(persistForSetup(source, ['reconfigure'], home), destination);
+  assert.equal(fs.readFileSync(destination, 'utf8'), 'reconfigure-binary');
+  fs.writeFileSync(source, 'global-options-binary', { mode: 0o755 });
+  assert.equal(persistForSetup(source, ['--root', home, '--json', 'settings'], home), destination);
+  assert.equal(fs.readFileSync(destination, 'utf8'), 'global-options-binary');
 });

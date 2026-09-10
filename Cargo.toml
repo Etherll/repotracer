@@ -6,25 +6,24 @@ members = [
     "crates/model",
     "crates/cli",
     "crates/mcp",
-    "crates/bench",
 ]
+exclude = ["crates/bench"]
 default-members = ["crates/cli"]
 
 [workspace.package]
-version = "1.0.1"
+version = "2.0.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/repotracer/repotracer"
 homepage = "https://github.com/repotracer/repotracer"
 authors = ["RepoTracer Contributors"]
-rust-version = "1.80"
+rust-version = "1.90"
 
 [workspace.dependencies]
 repotracer-core = { path = "crates/core" }
 repotracer-repo-tools = { path = "crates/repo-tools" }
 repotracer-model = { path = "crates/model" }
 repotracer-mcp = { path = "crates/mcp" }
-repotracer-bench = { path = "crates/bench" }
 
 anyhow = "1"
 async-trait = "0.1"

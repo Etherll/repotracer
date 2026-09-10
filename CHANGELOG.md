@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.0.0
+
+### Added
+
+- Codex and Claude Code parent integrations, with independent scout profiles.
+- A two-step terminal setup and settings wizard for parent and model selection.
+- Per-parent Advanced settings for different scout providers and model IDs.
+- Native subscription model discovery and `provider:model-id` custom entries.
+- Structured `repo_scout` results with source context, citations, usage fields,
+  and a readable text fallback.
+- Repository and focus selection, investigation intents, and related
+  follow-ups through bounded conversation handles.
+- Read-only repository tools with path and line-range citation validation.
+
+### Changed
+
+- Defaults are `codex:gpt-5.6-luna` for a Codex parent and `claude:sonnet` for
+  a Claude Code parent.
+- Parent profiles are configured independently and must be restarted after
+  settings changes.
+- Warm process retention and stream-inactivity handling are separate from
+  optional whole-investigation timeouts.
+- Documentation describes citation validation as location checking, not proof
+  that model-authored findings are correct.
+
+### Verification status
+
+The release candidate has passed GitHub CI on Linux, macOS, and Windows,
+including the native Codex app-server checks. This release note makes no savings, latency, or
+quality claim.
+
 ## 1.0.1 — 2026-08-30
 
 ### Fixed

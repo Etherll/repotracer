@@ -1,198 +1,89 @@
-//! A minimal arrow-key menu.
+//! Small, terminal-safe selection prompts.
 //!
-//! This is deliberately not a TUI framework. It needs one screen of options, so
-//! it drives the terminal directly: raw mode to read keys unbuffered, and cursor
-//! moves to repaint the list in place. Anything that cannot do that — Windows, a
-//! pipe, a terminal that rejects raw mode — falls back to a numbered prompt so
-//! the command still works everywhere.
+//! The prompt implementation belongs to `inquire`. Keeping this adapter small
+//! gives the rest of the CLI a stable `io::Result` API and, importantly, keeps
+//! non-interactive invocations from guessing a choice.
 
-use std::io::{self, IsTerminal, Write};
+use inquire::{error::InquireError, Select};
+use std::io::{self, IsTerminal};
 
 /// Ask the user to pick one of `options`, returning its index.
 ///
-/// Returns `None` when the user cancels with Esc, `q`, or Ctrl-C.
+/// Returns `None` when the user cancels with Esc or Ctrl-C. Interactive
+/// selection is intentionally unavailable when stdin or stderr is not a TTY;
+/// callers should use explicit command-line flags in that case.
 pub fn select(title: &str, options: &[&str], hint: &str) -> io::Result<Option<usize>> {
     if options.is_empty() {
         return Ok(None);
     }
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Ok(Some(0));
-    }
-    match arrow_select(title, options, hint) {
-        Ok(choice) => Ok(choice),
-        // Raw mode is unavailable on this terminal; degrade rather than fail.
-        Err(_) => numbered_select(title, options),
-    }
-}
+    require_interactive_terminal()?;
 
-fn numbered_select(title: &str, options: &[&str]) -> io::Result<Option<usize>> {
-    println!("\n{title}");
-    for (i, option) in options.iter().enumerate() {
-        println!("  {}) {option}", i + 1);
-    }
-    print!("\nChoose [1]: ");
-    io::stdout().flush()?;
-
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    let answer = answer.trim();
-    if answer.is_empty() {
-        return Ok(Some(0));
-    }
-    if matches!(answer, "q" | "Q") {
-        return Ok(None);
-    }
-    Ok(answer
-        .parse::<usize>()
-        .ok()
-        .filter(|n| (1..=options.len()).contains(n))
-        .map(|n| n - 1)
-        .or(Some(0)))
-}
-
-#[cfg(not(unix))]
-fn arrow_select(_: &str, _: &[&str], _: &str) -> io::Result<Option<usize>> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "no raw mode"))
-}
-
-#[cfg(unix)]
-fn arrow_select(title: &str, options: &[&str], hint: &str) -> io::Result<Option<usize>> {
-    let _raw = RawMode::enable()?;
-    let mut cursor = 0usize;
-    let mut out = io::stdout();
-
-    writeln!(out, "\r\n{title}\r")?;
-    if !hint.is_empty() {
-        writeln!(out, "{}\r", dim(hint))?;
-    }
-    draw(&mut out, options, cursor, false)?;
-
-    let mut buf = [0u8; 3];
-    loop {
-        let read = read_key(&mut buf)?;
-        let key = &buf[..read];
-        let action = match key {
-            [0x1b, b'[', b'A'] | [b'k'] => Action::Up,
-            [0x1b, b'[', b'B'] | [b'j'] => Action::Down,
-            [b'\r'] | [b'\n'] => Action::Accept,
-            // A bare Esc arrives alone; Esc-[ is the start of an arrow sequence.
-            [0x1b] | [b'q'] | [3] => Action::Cancel,
-            [b'1'..=b'9'] => {
-                let n = (key[0] - b'1') as usize;
-                if n < options.len() {
-                    cursor = n;
-                    Action::Accept
-                } else {
-                    Action::None
-                }
-            }
-            _ => Action::None,
-        };
-
-        match action {
-            Action::Up => cursor = (cursor + options.len() - 1) % options.len(),
-            Action::Down => cursor = (cursor + 1) % options.len(),
-            Action::Accept => {
-                redraw(&mut out, options, cursor, true)?;
-                return Ok(Some(cursor));
-            }
-            Action::Cancel => {
-                redraw(&mut out, options, cursor, true)?;
-                return Ok(None);
-            }
-            Action::None => continue,
-        }
-        redraw(&mut out, options, cursor, false)?;
+    let option_values: Vec<String> = options.iter().map(|option| (*option).to_owned()).collect();
+    let prompt = Select::new(title, option_values.clone())
+        .with_help_message(hint)
+        .prompt();
+    match prompt {
+        Ok(choice) => Ok(Some(choice_index(&choice, &option_values)?)),
+        Err(error) => map_inquire_error(error),
     }
 }
 
-enum Action {
-    Up,
-    Down,
-    Accept,
-    Cancel,
-    None,
+fn choice_index(choice: &str, options: &[String]) -> io::Result<usize> {
+    options
+        .iter()
+        .position(|option| option == choice)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "prompt returned an unknown choice",
+            )
+        })
 }
 
-fn draw(out: &mut impl Write, options: &[&str], cursor: usize, done: bool) -> io::Result<()> {
-    for (i, option) in options.iter().enumerate() {
-        if i == cursor {
-            writeln!(out, "  \x1b[1;32m>\x1b[0m \x1b[1m{option}\x1b[0m\r")?;
-        } else {
-            writeln!(out, "    {}\r", dim(option))?;
-        }
+pub(crate) fn require_interactive_terminal() -> io::Result<()> {
+    if io::stdin().is_terminal() && io::stderr().is_terminal() {
+        return Ok(());
     }
-    if done {
-        write!(out, "\x1b[?25h")?;
-    } else {
-        write!(out, "\x1b[?25l")?;
-    }
-    out.flush()
+
+    Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "interactive selection requires a terminal; pass explicit CLI options when stdin or stderr is redirected",
+    ))
 }
 
-fn redraw(out: &mut impl Write, options: &[&str], cursor: usize, done: bool) -> io::Result<()> {
-    write!(out, "\x1b[{}A", options.len())?;
-    draw(out, options, cursor, done)
-}
-
-fn dim(text: &str) -> String {
-    format!("\x1b[2m{text}\x1b[0m")
-}
-
-#[cfg(unix)]
-fn read_key(buf: &mut [u8; 3]) -> io::Result<usize> {
-    use std::io::Read;
-    let mut first = [0u8; 1];
-    io::stdin().read_exact(&mut first)?;
-    buf[0] = first[0];
-    if first[0] != 0x1b {
-        return Ok(1);
-    }
-    // Escape sequence: grab the two bytes that follow, if they are there.
-    let mut rest = [0u8; 2];
-    match io::stdin().read(&mut rest)? {
-        2 => {
-            buf[1] = rest[0];
-            buf[2] = rest[1];
-            Ok(3)
-        }
-        _ => Ok(1),
+pub(crate) fn map_inquire_error<T>(error: InquireError) -> io::Result<Option<T>> {
+    match error {
+        InquireError::OperationCanceled | InquireError::OperationInterrupted => Ok(None),
+        InquireError::IO(error) => Err(error),
+        InquireError::NotTTY => Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "interactive selection requires a terminal; pass explicit CLI options instead",
+        )),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            other.to_string(),
+        )),
     }
 }
 
-#[cfg(unix)]
-struct RawMode(libc::termios);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[cfg(unix)]
-impl RawMode {
-    fn enable() -> io::Result<Self> {
-        // SAFETY: tcgetattr/tcsetattr on a valid fd with a zeroed termios we own.
-        unsafe {
-            let mut original: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(libc::STDIN_FILENO, &mut original) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut raw = original;
-            raw.c_lflag &= !(libc::ICANON | libc::ECHO);
-            raw.c_cc[libc::VMIN] = 1;
-            raw.c_cc[libc::VTIME] = 0;
-            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(RawMode(original))
-        }
+    #[test]
+    fn empty_options_are_a_cancelled_selection() {
+        assert_eq!(select("unused", &[], "unused").unwrap(), None);
     }
-}
 
-#[cfg(unix)]
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        // Always restore the terminal, including on panic; a shell left in raw
-        // mode with the cursor hidden is unusable.
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0);
-        }
-        let _ = write!(io::stdout(), "\x1b[?25h");
-        let _ = io::stdout().flush();
+    #[test]
+    fn unknown_prompt_choice_is_an_error() {
+        let error = choice_index("missing", &["one".to_owned()]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn cancellation_is_not_an_io_failure() {
+        let result: io::Result<Option<usize>> = map_inquire_error(InquireError::OperationCanceled);
+        assert_eq!(result.unwrap(), None);
     }
 }

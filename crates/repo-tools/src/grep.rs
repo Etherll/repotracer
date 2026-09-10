@@ -211,7 +211,7 @@ impl GrepTool {
             cmd.arg("--glob").arg(ig);
         }
 
-        cmd.arg(&args.pattern);
+        cmd.arg("-e").arg(&args.pattern).arg("--");
         // Pass path relative to root when possible for cleaner output.
         let path_arg = search_path
             .strip_prefix(&self.root)
@@ -223,7 +223,7 @@ impl GrepTool {
             cmd.arg(&path_arg);
         }
 
-        let output = cmd.output().await.map_err(|e| {
+        let output = cmd.kill_on_drop(true).output().await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 ToolError::Message(
                     "ripgrep (`rg`) not found on PATH. Install: https://github.com/BurntSushi/ripgrep#installation"

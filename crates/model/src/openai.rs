@@ -12,9 +12,30 @@ pub struct OpenAiCompatBackend {
     config: ModelConfig,
 }
 
+/// Require encrypted transport when a custom endpoint receives an API key.
+/// HTTP remains available for unauthenticated local model servers.
+pub fn validate_api_endpoint(base_url: &str, api_key: Option<&str>) -> Result<(), ModelError> {
+    if api_key.is_some_and(|key| !key.trim().is_empty()) {
+        let url = reqwest::Url::parse(base_url)
+            .map_err(|_| ModelError::Request("invalid model endpoint URL".into()))?;
+        if url.scheme() != "https" {
+            return Err(ModelError::Request(
+                "an API key requires an HTTPS endpoint".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl OpenAiCompatBackend {
     pub fn new(config: ModelConfig) -> Result<Self, ModelError> {
-        let mut builder = reqwest::Client::builder();
+        validate_api_endpoint(&config.base_url, config.api_key.as_deref())?;
+        let mut builder = reqwest::Client::builder().https_only(
+            config
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()),
+        );
         if config.timeout_ms > 0 {
             builder = builder.timeout(Duration::from_millis(config.timeout_ms));
         }
@@ -56,6 +77,20 @@ impl ModelBackend for OpenAiCompatBackend {
         });
 
         let mut body = body;
+        if let Some(effort) = self
+            .config
+            .reasoning_effort
+            .as_deref()
+            .filter(|effort| !effort.trim().is_empty())
+        {
+            body["reasoning_effort"] = json!(effort);
+            // GPT reasoning models do not consistently accept temperature overrides.
+            body.as_object_mut().unwrap().remove("temperature");
+        }
+        if request.tools.is_empty() {
+            body.as_object_mut().unwrap().remove("tools");
+            body.as_object_mut().unwrap().remove("tool_choice");
+        }
         if let Some(max) = request.max_tokens.or(self.config.max_tokens) {
             body.as_object_mut()
                 .unwrap()
@@ -63,7 +98,12 @@ impl ModelBackend for OpenAiCompatBackend {
         }
 
         let mut req = self.client.post(&url).json(&body);
-        if let Some(key) = &self.config.api_key {
+        if let Some(key) = self
+            .config
+            .api_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+        {
             req = req.bearer_auth(key);
         }
 
@@ -72,8 +112,8 @@ impl ModelBackend for OpenAiCompatBackend {
                 ModelError::Timeout
             } else {
                 ModelError::Request(format!(
-                    "Could not reach GPT endpoint at {}",
-                    self.config.base_url
+                    "Could not reach model endpoint at {}",
+                    safe_endpoint(&self.config.base_url)
                 ))
             }
         })?;
@@ -84,14 +124,11 @@ impl ModelBackend for OpenAiCompatBackend {
             .await
             .map_err(|e| ModelError::Request(e.to_string()))?;
         if !status.is_success() {
-            return Err(ModelError::Request(format!(
-                "model HTTP {status}: {}",
-                truncate(&text, 800)
-            )));
+            return Err(ModelError::Request(format!("model HTTP {status}")));
         }
 
         let parsed: OpenAiChatResponse = serde_json::from_str(&text)
-            .map_err(|e| ModelError::InvalidResponse(format!("{e}: {}", truncate(&text, 400))))?;
+            .map_err(|e| ModelError::InvalidResponse(format!("invalid model response: {e}")))?;
 
         let choice = parsed
             .choices
@@ -103,11 +140,7 @@ impl ModelBackend for OpenAiCompatBackend {
         Ok(ModelResponse {
             message: msg,
             model: parsed.model.unwrap_or_else(|| self.config.model.clone()),
-            usage: parsed.usage.map(|u| Usage {
-                prompt_tokens: u.prompt_tokens.unwrap_or(0),
-                completion_tokens: u.completion_tokens.unwrap_or(0),
-                total_tokens: u.total_tokens.unwrap_or(0),
-            }),
+            usage: parsed.usage.map(Into::into),
         })
     }
 }
@@ -185,15 +218,15 @@ fn from_openai_message(m: OpenAiMessage) -> Result<ChatMessage, ModelError> {
     })
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        return s.to_string();
-    }
-    let mut end = n;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
+fn safe_endpoint(value: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(value) else {
+        return "configured endpoint".into();
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,14 +265,165 @@ struct OpenAiUsage {
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
     total_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiInputDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<OpenAiOutputDetails>,
+    #[serde(default)]
+    input_tokens_details: Option<OpenAiInputDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<OpenAiOutputDetails>,
+    /// Some OpenAI-compatible gateways use the Responses API names while
+    /// still exposing the Chat Completions response envelope.
+    #[serde(default)]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    output_tokens: Option<u32>,
+    #[serde(default)]
+    cache_write_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    cached_input_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OpenAiInputDetails {
+    #[serde(default, alias = "cachedInputTokens")]
+    cached_tokens: Option<u32>,
+    #[serde(default)]
+    cache_write_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OpenAiOutputDetails {
+    #[serde(default, alias = "reasoningTokens")]
+    reasoning_tokens: Option<u32>,
+}
+
+impl From<OpenAiUsage> for Usage {
+    fn from(value: OpenAiUsage) -> Self {
+        let input = value.prompt_tokens.or(value.input_tokens);
+        let output = value.completion_tokens.or(value.output_tokens);
+        let input_details = value.prompt_tokens_details.or(value.input_tokens_details);
+        let cached = input_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .or(value.cached_input_tokens);
+        let cache_write = value
+            .cache_write_input_tokens
+            .or(value.cache_creation_input_tokens)
+            .or_else(|| input_details.as_ref().and_then(|d| d.cache_write_tokens))
+            .or_else(|| {
+                input_details
+                    .as_ref()
+                    .and_then(|d| d.cache_creation_input_tokens)
+            });
+        let reasoning = value
+            .completion_tokens_details
+            .or(value.output_tokens_details)
+            .and_then(|d| d.reasoning_tokens);
+        Usage {
+            prompt_tokens: input,
+            completion_tokens: output,
+            total_tokens: value.total_tokens,
+            cached_prompt_tokens: cached,
+            cache_write_prompt_tokens: cache_write,
+            reasoning_output_tokens: reasoning,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::truncate;
+    use super::OpenAiUsage;
+    use crate::types::Usage;
+    use serde_json::json;
 
     #[test]
-    fn truncates_at_utf8_boundary() {
-        assert_eq!(truncate("1234567é", 8), "1234567…");
+    fn parses_cache_and_reasoning_subsets_without_filling_missing_fields() {
+        let parsed: Usage = serde_json::from_value::<OpenAiUsage>(json!({
+            "prompt_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 40},
+            "completion_tokens": 20,
+            "completion_tokens_details": {"reasoning_tokens": 5},
+            "total_tokens": 120
+        }))
+        .unwrap()
+        .into();
+        assert_eq!(parsed.prompt_tokens, Some(100));
+        assert_eq!(parsed.cached_prompt_tokens, Some(40));
+        assert_eq!(parsed.completion_tokens, Some(20));
+        assert_eq!(parsed.reasoning_output_tokens, Some(5));
+        assert_eq!(parsed.total_tokens, Some(120));
+        assert_eq!(parsed.cache_write_prompt_tokens, None);
+    }
+
+    #[test]
+    fn omitted_usage_dimensions_remain_unknown() {
+        let parsed: Usage = serde_json::from_value::<OpenAiUsage>(json!({
+            "prompt_tokens": 100
+        }))
+        .unwrap()
+        .into();
+        assert_eq!(parsed.prompt_tokens, Some(100));
+        assert_eq!(parsed.completion_tokens, None);
+        assert_eq!(parsed.total_tokens, None);
+        assert_eq!(parsed.cached_prompt_tokens, None);
+    }
+
+    #[test]
+    fn authenticated_completions_require_https_but_local_http_still_works() {
+        for (base_url, api_key, accepted) in [
+            ("http://127.0.0.1:8080/v1", None, true),
+            ("http://127.0.0.1:8080/v1", Some(""), true),
+            ("http://example.com/v1", Some("test-key"), false),
+            ("https://example.com/v1", Some("test-key"), true),
+            ("HTTPS://example.com/v1", Some("test-key"), true),
+        ] {
+            let config = super::ModelConfig {
+                base_url: base_url.into(),
+                api_key: api_key.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(
+                super::OpenAiCompatBackend::new(config).is_ok(),
+                accepted,
+                "{base_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_responses_api_usage_names_too() {
+        let parsed: Usage = serde_json::from_value::<OpenAiUsage>(json!({
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 40},
+            "output_tokens": 20,
+            "output_tokens_details": {"reasoning_tokens": 5},
+            "total_tokens": 120
+        }))
+        .unwrap()
+        .into();
+        assert_eq!(parsed.prompt_tokens, Some(100));
+        assert_eq!(parsed.cached_prompt_tokens, Some(40));
+        assert_eq!(parsed.completion_tokens, Some(20));
+        assert_eq!(parsed.reasoning_output_tokens, Some(5));
+        assert_eq!(parsed.total_tokens, Some(120));
+    }
+
+    #[test]
+    fn endpoint_redaction_removes_query_credentials() {
+        assert_eq!(
+            super::safe_endpoint("https://gateway.example/v1?api_key=secret#fragment"),
+            "https://gateway.example/v1"
+        );
+        assert_eq!(
+            super::safe_endpoint("https://user:secret@gateway.example/v1"),
+            "https://gateway.example/v1"
+        );
+        assert_eq!(super::safe_endpoint("not-a-url"), "configured endpoint");
     }
 }

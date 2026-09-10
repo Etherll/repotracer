@@ -15,6 +15,7 @@ from pathlib import Path
 
 
 COMMAND = 'rg -n "workspace" Cargo.toml'
+SYMBOLS = os.environ.get("REPOTRACER_SMOKE_SYMBOLS") == "1"
 USAGE = {
     "input_tokens": 0,
     "input_tokens_details": None,
@@ -31,6 +32,18 @@ def event_stream(events):
     ).encode()
 
 
+def validate_tool_result(request):
+    outputs = [
+        item.get("output") for item in request.get("input", [])
+        if item.get("type") == "function_call_output"
+        and item.get("call_id") == "read-workspace"
+    ]
+    tool_result = json.dumps(outputs, separators=(",", ":"))
+    expected = ["ScoutEngine", "crates/core/src/engine.rs"] if SYMBOLS else ["1:[workspace]"]
+    if not all(value in tool_result for value in expected):
+        raise AssertionError("Codex did not return the requested tool result: " + tool_result)
+
+
 class FakeResponses(BaseHTTPRequestHandler):
     calls = 0
     failure = None
@@ -45,8 +58,9 @@ class FakeResponses(BaseHTTPRequestHandler):
             type(self).calls += 1
             if type(self).calls == 1:
                 tool_names = [tool.get("name") for tool in request.get("tools", [])]
-                if "exec_command" not in tool_names:
-                    raise AssertionError(f"Codex did not offer exec_command: {tool_names}")
+                tool_name = "Symbols" if SYMBOLS else "exec_command"
+                if tool_name not in tool_names:
+                    raise AssertionError(f"Codex did not offer {tool_name}: {tool_names}")
                 body = event_stream(
                     [
                         {"type": "response.created", "response": {"id": "resp-1"}},
@@ -55,8 +69,8 @@ class FakeResponses(BaseHTTPRequestHandler):
                             "item": {
                                 "type": "function_call",
                                 "call_id": "read-workspace",
-                                "name": "exec_command",
-                                "arguments": json.dumps({"cmd": COMMAND}),
+                                "name": tool_name,
+                                "arguments": json.dumps({"symbol": "ScoutEngine", "path": "crates/core/src"} if SYMBOLS else {"cmd": COMMAND}),
                             },
                         },
                         {
@@ -66,11 +80,7 @@ class FakeResponses(BaseHTTPRequestHandler):
                     ]
                 )
             elif type(self).calls == 2:
-                tool_result = json.dumps(request, separators=(",", ":"))
-                if "1:[workspace]" not in tool_result:
-                    raise AssertionError(
-                        "Codex did not return the successful rg output: " + tool_result
-                    )
+                validate_tool_result(request)
                 answer = json.dumps(
                     {
                         "answer": "Found the workspace manifest.",
@@ -160,7 +170,10 @@ def read_response(lines, request_id, timeout=90):
 
 def main():
     root = Path(__file__).resolve().parents[1]
-    binary = root / "target" / "debug" / ("repotracer.exe" if os.name == "nt" else "repotracer")
+    binary = Path(os.environ.get(
+        "REPOTRACER_TEST_BINARY",
+        str(root / "target" / "debug" / ("repotracer.exe" if os.name == "nt" else "repotracer")),
+    )).resolve()
     codex = shutil.which("codex")
     if not binary.is_file():
         raise SystemExit(f"build RepoTracer first: {binary}")
@@ -250,7 +263,7 @@ def main():
                 raise AssertionError("RepoTracer recorded no completed command")
             if FakeResponses.failure:
                 raise AssertionError(FakeResponses.failure)
-            print("real Codex app-server repository read passed")
+            print("real Codex app-server " + ("dynamic Symbols" if SYMBOLS else "repository read") + " passed")
         except Exception:
             process.kill()
             process.wait()

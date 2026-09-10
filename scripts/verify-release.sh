@@ -33,7 +33,9 @@ if [[ "$PUBLISHED" -eq 1 ]]; then
 else
   step "Building"
   cargo build -q -p repotracer --manifest-path "$REPO/Cargo.toml" || fail "build failed"
-  BIN="$REPO/target/debug/repotracer"
+  build_target="${CARGO_TARGET_DIR:-$REPO/target}"
+  [[ "$build_target" = /* ]] || build_target="$PWD/$build_target"
+  BIN="$build_target/debug/repotracer"
   pass "$("$BIN" version)"
 fi
 
