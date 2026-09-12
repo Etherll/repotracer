@@ -73,6 +73,8 @@ struct App {
     custom_key_touched: bool,
     custom_loading: bool,
     custom_receiver: Option<mpsc::Receiver<Result<model_catalog::DiscoveredModels, String>>>,
+    custom_pending: Option<(usize, CustomApiProfile)>,
+    custom_discovered: [Option<(CustomApiProfile, model_catalog::DiscoveredModels)>; 2],
     picker: ListState,
     message: String,
     no_color: bool,
@@ -82,6 +84,13 @@ enum Outcome {
     Continue,
     Cancel,
     Save(ModelSelection),
+}
+
+fn same_origin(left: &str, right: &str) -> bool {
+    match (reqwest::Url::parse(left), reqwest::Url::parse(right)) {
+        (Ok(left), Ok(right)) => left.origin() == right.origin(),
+        _ => false,
+    }
 }
 
 impl App {
@@ -139,6 +148,8 @@ impl App {
             custom_key_touched: false,
             custom_loading: false,
             custom_receiver: None,
+            custom_pending: None,
+            custom_discovered: [None, None],
             picker: ListState::default(),
             message: String::new(),
             no_color: std::env::var_os("NO_COLOR").is_some(),
@@ -195,6 +206,9 @@ impl App {
 
     fn candidates(&self) -> Vec<ModelChoice> {
         let mut models = self.catalog.models.clone();
+        if let Some((_, (discovered, _))) = &self.custom_discovered[self.editing] {
+            models.extend(discovered.clone());
+        }
         if let Some(saved) = &self.choices[self.editing] {
             if !models.iter().any(|model| same_model(model, saved)) {
                 models.push(saved.clone());
@@ -225,60 +239,62 @@ impl App {
     }
 
     fn update_effort_for(&mut self, index: usize) {
-        self.selected_efforts[index] = self.choices[index].as_ref().and_then(|model| {
-            self.catalog
-                .reasoning_efforts
-                .get(&model_catalog::model_key(&model.provider, &model.id))
-                .and_then(|levels| {
-                    let current = self.selected_efforts[index].as_deref();
-                    current
-                        .filter(|value| levels.iter().any(|level| level == value))
-                        .map(str::to_owned)
-                        .or_else(|| levels.iter().find(|level| *level != "low").cloned())
-                        .or_else(|| levels.first().cloned())
-                })
-        });
+        // Missing metadata is unknown; only an advertised list can replace a setting.
+        if let Some(levels) = self.known_efforts(index) {
+            self.selected_efforts[index] = self.selected_efforts[index]
+                .as_ref()
+                .filter(|value| levels.contains(value))
+                .cloned()
+                .or_else(|| levels.iter().find(|level| *level != "low").cloned())
+                .or_else(|| levels.first().cloned());
+        }
+    }
+
+    fn known_efforts(&self, index: usize) -> Option<&Vec<String>> {
+        let model = self.choices[index].as_ref()?;
+        let key = model_catalog::model_key(&model.provider, &model.id);
+        if model.provider == "openai-compatible" {
+            let (connection, (_, efforts)) = self.custom_discovered[index].as_ref()?;
+            if self.custom[index].as_ref() != Some(connection) {
+                return None;
+            }
+            efforts.get(&key)
+        } else {
+            self.catalog.reasoning_efforts.get(&key)
+        }
     }
 
     fn choose_model(&mut self, model: ModelChoice) {
         let index = self.editing;
+        let old_connection = self.custom[index].clone();
+        let same = self.choices[index]
+            .as_ref()
+            .is_some_and(|old| same_model(old, &model));
         if model.provider == "openai-compatible" {
+            if let Some((connection, (models, _))) = &self.custom_discovered[index] {
+                if models.iter().any(|entry| same_model(entry, &model)) {
+                    self.custom[index] = Some(connection.clone());
+                }
+            }
             if self.custom[index].is_none() {
-                self.custom[index] = Some(CustomApiProfile {
-                    base_url: self.custom_fields[0].clone(),
-                    api_key: (!self.custom_fields[2].is_empty())
-                        .then(|| self.custom_fields[2].clone()),
-                });
+                self.custom[index] = Some(self.custom_connection());
             }
         } else {
             self.custom[index] = None;
+        }
+        if !same || old_connection != self.custom[index] {
+            self.selected_efforts[index] = None;
         }
         self.choices[index] = Some(model);
         self.update_effort_for(index);
     }
 
     fn effort_candidates(&self) -> Vec<String> {
-        self.choices[self.editing]
-            .as_ref()
-            .and_then(|model| {
-                self.catalog
-                    .reasoning_efforts
-                    .get(&model_catalog::model_key(&model.provider, &model.id))
-            })
-            .cloned()
-            .unwrap_or_default()
+        self.effort_candidates_for(self.editing)
     }
 
     fn effort_candidates_for(&self, index: usize) -> Vec<String> {
-        self.choices[index]
-            .as_ref()
-            .and_then(|model| {
-                self.catalog
-                    .reasoning_efforts
-                    .get(&model_catalog::model_key(&model.provider, &model.id))
-            })
-            .cloned()
-            .unwrap_or_default()
+        self.known_efforts(index).cloned().unwrap_or_default()
     }
 
     fn open_effort(&mut self, index: usize) {
@@ -293,6 +309,7 @@ impl App {
     }
 
     fn open_custom(&mut self) {
+        self.invalidate_custom_discovery();
         self.custom_field = 0;
         if let Some(profile) = &self.custom[self.editing] {
             self.custom_fields[0] = profile.base_url.clone();
@@ -319,10 +336,13 @@ impl App {
             self.message = "Enter a base URL before discovering models.".into();
             return;
         }
-        let key = (!self.custom_fields[2].is_empty()).then(|| self.custom_fields[2].clone());
+        let connection = self.custom_connection();
+        let key = connection.api_key.clone();
+        self.invalidate_custom_discovery();
         let (sender, receiver) = mpsc::channel();
         self.custom_loading = true;
         self.custom_receiver = Some(receiver);
+        self.custom_pending = Some((self.editing, connection));
         std::thread::spawn(move || {
             let result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -338,6 +358,62 @@ impl App {
                 });
             let _ = sender.send(result);
         });
+    }
+
+    fn custom_connection(&self) -> CustomApiProfile {
+        let base_url = self.custom_fields[0].trim().to_owned();
+        let entered_key = &self.custom_fields[2];
+        CustomApiProfile {
+            api_key: if self.custom_key_touched || !entered_key.trim().is_empty() {
+                (!entered_key.trim().is_empty()).then(|| entered_key.clone())
+            } else {
+                self.custom[self.editing]
+                    .as_ref()
+                    .filter(|profile| same_origin(&profile.base_url, &base_url))
+                    .and_then(|profile| profile.api_key.clone())
+            },
+            base_url,
+        }
+    }
+
+    fn invalidate_custom_discovery(&mut self) {
+        self.custom_receiver = None;
+        self.custom_pending = None;
+        self.custom_loading = false;
+        self.custom_discovered[self.editing] = None;
+    }
+
+    fn poll_custom_discovery(&mut self) {
+        let Some(receiver) = &self.custom_receiver else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("Model discovery stopped unexpectedly.".into())
+            }
+        };
+        self.custom_receiver = None;
+        self.custom_loading = false;
+        let Some((parent, connection)) = self.custom_pending.take() else {
+            return;
+        };
+        if parent != self.editing
+            || self.page != Page::Custom
+            || connection != self.custom_connection()
+        {
+            return;
+        }
+        match result {
+            Ok(models) => {
+                self.custom_discovered[parent] = Some((connection, models));
+                self.page = Page::Picker;
+                self.query.clear();
+                self.picker.select(Some(0));
+            }
+            Err(error) => self.message = format!("Model discovery failed: {error}"),
+        }
     }
 
     fn handle(&mut self, key: KeyEvent) -> Outcome {
@@ -451,6 +527,7 @@ impl App {
             }
             Page::Custom => match key.code {
                 KeyCode::Esc => {
+                    self.invalidate_custom_discovery();
                     self.page = Page::Picker;
                     self.query.clear();
                     self.picker.select(Some(0));
@@ -480,33 +557,30 @@ impl App {
                     } else if model.is_empty() || model.chars().any(char::is_control) {
                         self.message = "Enter a model ID, or press F2 to discover models.".into();
                     } else {
-                        self.custom[self.editing] = Some(CustomApiProfile {
-                            base_url: base_url.into(),
-                            api_key: if self.custom_key_touched || !self.custom_fields[2].is_empty()
-                            {
-                                (!self.custom_fields[2].is_empty())
-                                    .then(|| self.custom_fields[2].clone())
-                            } else {
-                                self.custom[self.editing]
-                                    .as_ref()
-                                    .and_then(|profile| profile.api_key.clone())
-                            },
-                        });
+                        let model = model.to_owned();
+                        let connection = self.custom_connection();
+                        self.invalidate_custom_discovery();
+                        if self.custom[self.editing].as_ref() != Some(&connection) {
+                            self.selected_efforts[self.editing] = None;
+                        }
+                        self.custom[self.editing] = Some(connection);
                         self.choose_model(ModelChoice {
                             provider: "openai-compatible".into(),
-                            id: model.into(),
                             label: format!("Custom API — {model}"),
+                            id: model,
                         });
                         self.page = Page::Models;
                     }
                 }
                 KeyCode::Backspace => {
+                    self.invalidate_custom_discovery();
                     if self.custom_field == 2 && !self.custom_key_touched {
                         self.custom_key_touched = true;
                     }
                     self.custom_fields[self.custom_field].pop();
                 }
                 KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.invalidate_custom_discovery();
                     if self.custom_field == 2 && !self.custom_key_touched {
                         self.custom_key_touched = true;
                         self.custom_fields[2].clear();
@@ -551,12 +625,20 @@ impl App {
         }
     }
 
-    fn model_text(&self, model: &ModelChoice) -> String {
-        let known = self
-            .catalog
-            .models
-            .iter()
-            .any(|candidate| same_model(candidate, model));
+    fn model_text(&self, index: usize, model: &ModelChoice, discovery_result: bool) -> String {
+        let known = if model.provider == "openai-compatible" {
+            self.custom_discovered[index]
+                .as_ref()
+                .is_some_and(|(connection, (models, _))| {
+                    models.iter().any(|candidate| same_model(candidate, model))
+                        && (discovery_result || self.custom[index].as_ref() == Some(connection))
+                })
+        } else {
+            self.catalog
+                .models
+                .iter()
+                .any(|candidate| same_model(candidate, model))
+        };
         let suffix = if self.loading {
             ""
         } else if !known {
@@ -693,7 +775,7 @@ impl App {
                             .as_deref()
                             .map(|effort| format!(" · effort {effort}"))
                             .unwrap_or_default();
-                        format!("{}{effort}", self.model_text(model))
+                        format!("{}{effort}", self.model_text(*index, model, false))
                     })
                     .unwrap_or_else(|| "Choose a model".into());
                 if compact {
@@ -788,13 +870,7 @@ impl App {
                     .iter()
                     .enumerate()
                     .map(|(index, label)| {
-                        let value = if index == 2
-                            && (!self.custom_fields[index].is_empty()
-                                || self.custom[self.editing]
-                                    .as_ref()
-                                    .and_then(|profile| profile.api_key.as_ref())
-                                    .is_some())
-                        {
+                        let value = if index == 2 && self.custom_connection().api_key.is_some() {
                             "••••••••".to_owned()
                         } else {
                             self.custom_fields[index].clone()
@@ -813,7 +889,7 @@ impl App {
                 let mut rows: Vec<ListItem> = self
                     .candidates()
                     .iter()
-                    .map(|model| ListItem::new(self.model_text(model)))
+                    .map(|model| ListItem::new(self.model_text(self.editing, model, true)))
                     .collect();
                 rows.push(ListItem::new("Custom model..."));
                 let highlight = self.highlight();
@@ -883,33 +959,7 @@ pub fn configure_with_profiles(
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        if app.custom_loading {
-            if let Some(receiver) = &app.custom_receiver {
-                match receiver.try_recv() {
-                    Ok(Ok((models, efforts))) => {
-                        app.catalog.models.extend(models);
-                        app.catalog.reasoning_efforts.extend(efforts);
-                        app.custom_loading = false;
-                        app.custom_receiver = None;
-                        app.loading = false;
-                        app.page = Page::Picker;
-                        app.query.clear();
-                        app.picker.select(Some(0));
-                    }
-                    Ok(Err(error)) => {
-                        app.custom_loading = false;
-                        app.custom_receiver = None;
-                        app.message = format!("Model discovery failed: {error}");
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        app.custom_loading = false;
-                        app.custom_receiver = None;
-                        app.message = "Model discovery stopped unexpectedly.".into();
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                }
-            }
-        }
+        app.poll_custom_discovery();
         terminal.draw(|frame| app.draw(frame))?;
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
@@ -1014,7 +1064,7 @@ mod tests {
         assert_eq!(app.choices[0], Some(saved.clone()));
         app.open_picker(0);
         assert!(app.candidates().contains(&saved));
-        assert!(app.model_text(&saved).contains("unverified"));
+        assert!(app.model_text(0, &saved, false).contains("unverified"));
     }
 
     #[test]
@@ -1096,6 +1146,171 @@ mod tests {
         key(&mut app, KeyCode::Char('n'));
         assert_eq!(app.custom_fields[2], "n");
         assert!(app.custom_key_touched);
+    }
+
+    fn saved_custom_app() -> App {
+        App::new_with_profiles(
+            &["codex".into()],
+            &[CurrentProfile {
+                parent: "codex".into(),
+                choice: Some(model("openai-compatible", "private")),
+                custom: Some(CustomApiProfile {
+                    base_url: "https://old.example/v1".into(),
+                    api_key: Some("saved-secret".into()),
+                }),
+                reasoning_effort: Some("high".into()),
+            }],
+        )
+    }
+
+    fn pending_discovery(
+        app: &mut App,
+    ) -> mpsc::Sender<Result<model_catalog::DiscoveredModels, String>> {
+        let (sender, receiver) = mpsc::channel();
+        app.custom_pending = Some((app.editing, app.custom_connection()));
+        app.custom_receiver = Some(receiver);
+        app.custom_loading = true;
+        sender
+    }
+
+    fn discovered() -> model_catalog::DiscoveredModels {
+        (
+            vec![model("openai-compatible", "private")],
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn custom_discovery_and_manual_save_share_effective_credentials() {
+        for (base_url, key_edit, expected_key) in [
+            ("https://old.example/v2", None, Some("saved-secret")),
+            ("https://new.example/v1", None, None),
+            (
+                "https://new.example/v1",
+                Some("replacement"),
+                Some("replacement"),
+            ),
+            ("https://new.example/v1", Some(""), None),
+            ("https://new.example/v1", Some("  "), None),
+        ] {
+            for discover in [false, true] {
+                let mut app = saved_custom_app();
+                app.open_custom();
+                app.custom_fields[0] = base_url.into();
+                if let Some(value) = key_edit {
+                    app.custom_field = 2;
+                    key(&mut app, KeyCode::Backspace);
+                    type_text(&mut app, value);
+                }
+                assert_eq!(app.custom_connection().api_key.as_deref(), expected_key);
+                let rendered = screen(&mut app, 100, 30);
+                assert!(!rendered.contains("saved-secret"));
+                assert!(!rendered.contains("replacement"));
+                assert_eq!(rendered.contains("••••••••"), expected_key.is_some());
+                if discover {
+                    let sender = pending_discovery(&mut app);
+                    assert_eq!(
+                        app.custom_pending.as_ref().unwrap().1.api_key.as_deref(),
+                        expected_key
+                    );
+                    sender.send(Ok(discovered())).unwrap();
+                    app.poll_custom_discovery();
+                    assert_eq!(app.page, Page::Picker);
+                    key(&mut app, KeyCode::Enter);
+                } else {
+                    app.custom_field = 2;
+                    key(&mut app, KeyCode::Enter);
+                }
+                let Outcome::Save(selection) = app.save() else {
+                    panic!("save failed")
+                };
+                let profile = selection.0[0].custom.as_ref().unwrap();
+                assert_eq!(profile.base_url, base_url);
+                assert_eq!(profile.api_key.as_deref(), expected_key);
+                assert_eq!(selection.0[0].reasoning_effort, None);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_discovery_cannot_replace_newer_form_or_cancelled_page() {
+        let mut app = saved_custom_app();
+        app.open_custom();
+        let old = pending_discovery(&mut app);
+        key(&mut app, KeyCode::Char('x'));
+        let new = pending_discovery(&mut app);
+        new.send(Ok(discovered())).unwrap();
+        app.poll_custom_discovery();
+        assert!(old.send(Err("stale".into())).is_err());
+        assert_eq!(
+            app.custom_discovered[0].as_ref().unwrap().0.base_url,
+            "https://old.example/v1x"
+        );
+        app.open_custom();
+        let cancelled = pending_discovery(&mut app);
+        key(&mut app, KeyCode::Esc);
+        assert!(cancelled.send(Ok(discovered())).is_err());
+        app.poll_custom_discovery();
+        assert_eq!(app.page, Page::Picker);
+        assert!(app.custom_discovered[0].is_none());
+    }
+
+    #[test]
+    fn unknown_capabilities_preserve_effort_but_explicit_evidence_updates_it() {
+        let mut app = saved_custom_app();
+        app.set_catalog(Catalog::default());
+        assert_eq!(app.selected_efforts[0].as_deref(), Some("high"));
+        app.open_custom();
+        pending_discovery(&mut app).send(Ok(discovered())).unwrap();
+        app.poll_custom_discovery();
+        app.choose_model(model("openai-compatible", "private"));
+        assert_eq!(app.selected_efforts[0].as_deref(), Some("high"));
+        for (levels, expected) in [
+            (vec!["medium".into(), "high".into()], Some("high")),
+            (vec!["medium".into()], Some("medium")),
+            (vec![], None),
+        ] {
+            app.custom_discovered[0].as_mut().unwrap().1 .1.insert(
+                model_catalog::model_key("openai-compatible", "private"),
+                levels,
+            );
+            app.update_effort_for(0);
+            assert_eq!(app.selected_efforts[0].as_deref(), expected);
+        }
+        app.selected_efforts[0] = Some("high".into());
+        app.choose_model(model("codex", "another"));
+        assert_eq!(app.selected_efforts[0], None);
+    }
+
+    #[test]
+    fn native_refresh_does_not_erase_custom_results_or_unknown_native_effort() {
+        let mut app = saved_custom_app();
+        app.open_custom();
+        pending_discovery(&mut app).send(Ok(discovered())).unwrap();
+        app.poll_custom_discovery();
+        app.set_catalog(Catalog::default());
+        assert!(app.custom_discovered[0].is_some());
+        let custom_model = model("openai-compatible", "private");
+        assert!(!app
+            .model_text(0, &custom_model, true)
+            .contains("unverified"));
+        app.choose_model(custom_model.clone());
+        app.page = Page::Models;
+        assert!(!app
+            .model_text(0, &custom_model, false)
+            .contains("unverified"));
+        assert!(app
+            .model_text(1, &custom_model, false)
+            .contains("unverified"));
+        app.open_picker(1);
+        assert!(!app
+            .candidates()
+            .iter()
+            .any(|m| m.provider == "openai-compatible"));
+        app.choices[1] = Some(model("codex", "native"));
+        app.selected_efforts[1] = Some("high".into());
+        app.set_catalog(Catalog::default());
+        assert_eq!(app.selected_efforts[1].as_deref(), Some("high"));
     }
 
     #[test]
