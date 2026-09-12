@@ -86,6 +86,13 @@ enum Outcome {
     Save(ModelSelection),
 }
 
+fn same_origin(left: &str, right: &str) -> bool {
+    match (reqwest::Url::parse(left), reqwest::Url::parse(right)) {
+        (Ok(left), Ok(right)) => left.origin() == right.origin(),
+        _ => false,
+    }
+}
+
 impl App {
     #[cfg(test)]
     fn new(installed: &[String], current: &[(String, Option<ModelChoice>)]) -> Self {
@@ -354,15 +361,18 @@ impl App {
     }
 
     fn custom_connection(&self) -> CustomApiProfile {
+        let base_url = self.custom_fields[0].trim().to_owned();
+        let entered_key = &self.custom_fields[2];
         CustomApiProfile {
-            base_url: self.custom_fields[0].trim().to_owned(),
-            api_key: if self.custom_key_touched || !self.custom_fields[2].is_empty() {
-                (!self.custom_fields[2].is_empty()).then(|| self.custom_fields[2].clone())
+            api_key: if self.custom_key_touched || !entered_key.trim().is_empty() {
+                (!entered_key.trim().is_empty()).then(|| entered_key.clone())
             } else {
                 self.custom[self.editing]
                     .as_ref()
+                    .filter(|profile| same_origin(&profile.base_url, &base_url))
                     .and_then(|profile| profile.api_key.clone())
             },
+            base_url,
         }
     }
 
@@ -1172,18 +1182,26 @@ mod tests {
 
     #[test]
     fn custom_discovery_and_manual_save_share_effective_credentials() {
-        for key_edit in [None, Some("replacement"), Some("")] {
+        for (base_url, key_edit, expected_key) in [
+            ("https://old.example/v2", None, Some("saved-secret")),
+            ("https://new.example/v1", None, None),
+            (
+                "https://new.example/v1",
+                Some("replacement"),
+                Some("replacement"),
+            ),
+            ("https://new.example/v1", Some(""), None),
+            ("https://new.example/v1", Some("  "), None),
+        ] {
             for discover in [false, true] {
                 let mut app = saved_custom_app();
                 app.open_custom();
-                app.custom_fields[0] = "https://new.example/v1".into();
+                app.custom_fields[0] = base_url.into();
                 if let Some(value) = key_edit {
                     app.custom_field = 2;
                     key(&mut app, KeyCode::Backspace);
                     type_text(&mut app, value);
                 }
-                let expected_key = key_edit.unwrap_or("saved-secret");
-                let expected_key = (!expected_key.is_empty()).then_some(expected_key);
                 assert_eq!(app.custom_connection().api_key.as_deref(), expected_key);
                 let rendered = screen(&mut app, 100, 30);
                 assert!(!rendered.contains("saved-secret"));
@@ -1207,7 +1225,7 @@ mod tests {
                     panic!("save failed")
                 };
                 let profile = selection.0[0].custom.as_ref().unwrap();
-                assert_eq!(profile.base_url, "https://new.example/v1");
+                assert_eq!(profile.base_url, base_url);
                 assert_eq!(profile.api_key.as_deref(), expected_key);
                 assert_eq!(selection.0[0].reasoning_effort, None);
             }
