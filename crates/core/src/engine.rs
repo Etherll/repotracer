@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 #[derive(Clone, Default)]
 struct UsageAccumulator {
     observed: bool,
+    missing_generation: bool,
     input_tokens: u64,
     cached_input_tokens: u64,
     cache_write_input_tokens: u64,
@@ -32,6 +33,14 @@ struct UsageAccumulator {
 }
 
 impl UsageAccumulator {
+    // Totals from reported generations remain lower bounds after missing usage.
+    fn record(&mut self, usage: Option<&Usage>) {
+        match usage {
+            Some(usage) => self.add(usage),
+            None => self.missing_generation = true,
+        }
+    }
+
     fn add(&mut self, usage: &Usage) {
         self.observed = true;
         add_dimension(
@@ -84,7 +93,8 @@ impl UsageAccumulator {
             ),
             total_tokens: known_total(self.total_tokens, self.total_missing),
         };
-        let complete = !self.input_missing
+        let complete = !self.missing_generation
+            && !self.input_missing
             && !self.cached_input_missing
             && !self.cache_write_input_missing
             && !self.output_missing
@@ -268,10 +278,8 @@ impl ScoutEngine {
                 .await
                 .map_err(|error| failure_with_usage(error, &usage))?;
 
-            if let Some(u) = &response.usage {
-                usage.add(u);
-                *observed_usage.lock().unwrap_or_else(|e| e.into_inner()) = usage.clone();
-            }
+            usage.record(response.usage.as_ref());
+            *observed_usage.lock().unwrap_or_else(|e| e.into_inner()) = usage.clone();
 
             let msg = response.message;
             messages.push(msg.clone());
@@ -606,6 +614,35 @@ mod tests {
 
     #[tokio::test]
     async fn usage_aggregates_each_generation_once() {
+        check_generation_usage(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn missing_generation_usage_is_sticky() {
+        check_generation_usage(false, true).await;
+        check_generation_usage(true, false).await;
+        check_generation_usage(false, false).await;
+    }
+
+    #[test]
+    fn missing_usage_preserves_dimension_and_failure_semantics() {
+        let mut usage = UsageAccumulator::default();
+        usage.record(None);
+        let mut reported = reported_usage(100);
+        reported.prompt_tokens = Some(u32::MAX);
+        reported.cached_prompt_tokens = None;
+        usage.record(Some(&reported));
+        usage.record(Some(&reported));
+        let (totals, status) = usage.finish();
+        assert_eq!(status, UsageStatus::Partial);
+        assert_eq!(totals.input_tokens, Some(u32::MAX));
+        assert_eq!(totals.cached_input_tokens, None);
+        let diagnostic = failure_with_usage("provider stopped", &usage).to_string();
+        assert!(diagnostic.contains("partial"));
+        assert!(diagnostic.contains(&u32::MAX.to_string()));
+    }
+
+    async fn check_generation_usage(first: bool, second: bool) {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("lib.rs"), "fn answer() {}\n").unwrap();
         let model = Arc::new(UsageModel {
@@ -620,14 +657,14 @@ mod tests {
                         }],
                     ),
                     model: "usage-mock".into(),
-                    usage: Some(reported_usage(100)),
+                    usage: first.then(|| reported_usage(100)),
                 }),
                 Ok(ModelResponse {
                     message: ChatMessage::assistant(
                         "<final_answer>\nlib.rs:1-1 (answer)\n</final_answer>",
                     ),
                     model: "usage-mock".into(),
-                    usage: Some(reported_usage(40)),
+                    usage: second.then(|| reported_usage(40)),
                 }),
             ])),
         });
@@ -644,6 +681,27 @@ mod tests {
             .await
             .unwrap();
 
+        if !(first && second) {
+            assert_eq!(
+                result.stats.usage_status,
+                if first || second {
+                    UsageStatus::Partial
+                } else {
+                    UsageStatus::Unknown
+                }
+            );
+            assert_eq!(
+                result.stats.prompt_tokens,
+                if first {
+                    Some(100)
+                } else if second {
+                    Some(40)
+                } else {
+                    None
+                }
+            );
+            return;
+        }
         assert_eq!(result.stats.prompt_tokens, Some(140));
         assert_eq!(result.stats.cached_prompt_tokens, Some(70));
         assert_eq!(result.stats.cache_write_prompt_tokens, Some(14));
