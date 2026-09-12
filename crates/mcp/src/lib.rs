@@ -963,6 +963,9 @@ fn rpc_error(code: i64, message: String) -> Value {
 }
 
 #[cfg(test)]
+mod repository_tools_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
