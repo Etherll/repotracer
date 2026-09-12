@@ -615,12 +615,20 @@ impl App {
         }
     }
 
-    fn model_text(&self, model: &ModelChoice) -> String {
-        let known = self
-            .catalog
-            .models
-            .iter()
-            .any(|candidate| same_model(candidate, model));
+    fn model_text(&self, index: usize, model: &ModelChoice, discovery_result: bool) -> String {
+        let known = if model.provider == "openai-compatible" {
+            self.custom_discovered[index]
+                .as_ref()
+                .is_some_and(|(connection, (models, _))| {
+                    models.iter().any(|candidate| same_model(candidate, model))
+                        && (discovery_result || self.custom[index].as_ref() == Some(connection))
+                })
+        } else {
+            self.catalog
+                .models
+                .iter()
+                .any(|candidate| same_model(candidate, model))
+        };
         let suffix = if self.loading {
             ""
         } else if !known {
@@ -757,7 +765,7 @@ impl App {
                             .as_deref()
                             .map(|effort| format!(" · effort {effort}"))
                             .unwrap_or_default();
-                        format!("{}{effort}", self.model_text(model))
+                        format!("{}{effort}", self.model_text(*index, model, false))
                     })
                     .unwrap_or_else(|| "Choose a model".into());
                 if compact {
@@ -871,7 +879,7 @@ impl App {
                 let mut rows: Vec<ListItem> = self
                     .candidates()
                     .iter()
-                    .map(|model| ListItem::new(self.model_text(model)))
+                    .map(|model| ListItem::new(self.model_text(self.editing, model, true)))
                     .collect();
                 rows.push(ListItem::new("Custom model..."));
                 let highlight = self.highlight();
@@ -1046,7 +1054,7 @@ mod tests {
         assert_eq!(app.choices[0], Some(saved.clone()));
         app.open_picker(0);
         assert!(app.candidates().contains(&saved));
-        assert!(app.model_text(&saved).contains("unverified"));
+        assert!(app.model_text(0, &saved, false).contains("unverified"));
     }
 
     #[test]
@@ -1264,6 +1272,18 @@ mod tests {
         app.poll_custom_discovery();
         app.set_catalog(Catalog::default());
         assert!(app.custom_discovered[0].is_some());
+        let custom_model = model("openai-compatible", "private");
+        assert!(!app
+            .model_text(0, &custom_model, true)
+            .contains("unverified"));
+        app.choose_model(custom_model.clone());
+        app.page = Page::Models;
+        assert!(!app
+            .model_text(0, &custom_model, false)
+            .contains("unverified"));
+        assert!(app
+            .model_text(1, &custom_model, false)
+            .contains("unverified"));
         app.open_picker(1);
         assert!(!app
             .candidates()
