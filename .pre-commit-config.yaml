@@ -1,3 +1,8 @@
+ci:
+  # pre-commit.ci does not provide cargo. GitHub CI runs this hook on Linux and
+  # macOS after installing the Rust toolchain.
+  skip: [fmt]
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
