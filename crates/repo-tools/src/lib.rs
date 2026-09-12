@@ -63,6 +63,13 @@ impl RepoTools {
         &self.root
     }
 
+    /// Create independent tools for a request while retaining execution limits.
+    pub fn for_root(&self, root: impl Into<PathBuf>) -> Self {
+        Self::new(root)
+            .with_concurrency(self.concurrency)
+            .with_timeout(self.timeout)
+    }
+
     pub fn schemas(&self) -> Vec<ToolSchema> {
         vec![
             self.read.schema(),

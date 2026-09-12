@@ -1542,6 +1542,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "repotracer-core",
+ "repotracer-model",
  "repotracer-repo-tools",
  "serde",
  "serde_json",
