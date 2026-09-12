@@ -221,14 +221,14 @@ impl ScoutEngine {
         max_turns: u32,
         observed_usage: Arc<Mutex<UsageAccumulator>>,
     ) -> anyhow::Result<ScoutResult> {
+        let tools = self.tools.for_root(request.root.clone());
         let system = build_system_prompt(&request.root);
         let mut messages = vec![
             ChatMessage::system(system),
             ChatMessage::user(crate::investigation_prompt(&request)),
         ];
 
-        let tool_specs: Vec<ToolSpec> = self
-            .tools
+        let tool_specs: Vec<ToolSpec> = tools
             .definitions()
             .into_iter()
             .map(|d| ToolSpec {
@@ -319,7 +319,7 @@ impl ScoutEngine {
                             arguments: sandbox_search_arguments(
                                 &c.name,
                                 &c.arguments,
-                                self.tools.root(),
+                                tools.root(),
                             ),
                         })
                         .collect();
@@ -328,7 +328,7 @@ impl ScoutEngine {
                     }
 
                     debug!(count = tool_calls.len(), "executing tools concurrently");
-                    let results = self.tools.call_many(&tool_calls).await;
+                    let results = tools.call_many(&tool_calls).await;
                     tool_calls_total += results.len() as u32;
                     for result in results {
                         messages.push(ChatMessage::tool(result.tool_call_id, result.output));
